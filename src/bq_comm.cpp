@@ -1,0 +1,395 @@
+#include "bq_comm.h"
+#include "config.h" 
+#include "B0_reg.h" 
+#include "bq79600_reg.h" 
+
+static const uint16_t crc16_ibm_table[256] = {
+    0x0000, 0xC0C1, 0xC181, 0x0140, 0xC301, 0x03C0, 0x0280, 0xC241,
+    0xC601, 0x06C0, 0x0780, 0xC741, 0x0500, 0xC5C1, 0xC481, 0x0440,
+    0xCC01, 0x0CC0, 0x0D80, 0xCD41, 0x0F00, 0xCFC1, 0xCE81, 0x0E40,
+    0x0A00, 0xCAC1, 0xCB81, 0x0B40, 0xC901, 0x09C0, 0x0880, 0xC841,
+    0xD801, 0x18C0, 0x1980, 0xD941, 0x1B00, 0xDBC1, 0xDA81, 0x1A40,
+    0x1E00, 0xDEC1, 0xDF81, 0x1F40, 0xDD01, 0x1DC0, 0x1C80, 0xDC41,
+    0x1400, 0xD4C1, 0xD581, 0x1540, 0xD701, 0x17C0, 0x1680, 0xD641,
+    0xD201, 0x12C0, 0x1380, 0xD341, 0x1100, 0xD1C1, 0xD081, 0x1040,
+    0xF001, 0x30C0, 0x3180, 0xF141, 0x3300, 0xF3C1, 0xF281, 0x3240,
+    0x3600, 0xF6C1, 0xF781, 0x3740, 0xF501, 0x35C0, 0x3480, 0xF441,
+    0x3C00, 0xFCC1, 0xFD81, 0x3D40, 0xFF01, 0x3FC0, 0x3E80, 0xFE41,
+    0xFA01, 0x3AC0, 0x3B80, 0xFB41, 0x3900, 0xF9C1, 0xF881, 0x3840,
+    0x2800, 0xE8C1, 0xE981, 0x2940, 0xEB01, 0x2BC0, 0x2A80, 0xEA41,
+    0xEE01, 0x2EC0, 0x2F80, 0xEF41, 0x2D00, 0xEDC1, 0xEC81, 0x2C40,
+    0xE401, 0x24C0, 0x2580, 0xE541, 0x2700, 0xE7C1, 0xE681, 0x2640,
+    0x2200, 0xE2C1, 0xE381, 0x2340, 0xE101, 0x21C0, 0x2080, 0xE041,
+    0xA001, 0x60C0, 0x6180, 0xA141, 0x6300, 0xA3C1, 0xA281, 0x6240,
+    0x6600, 0xA6C1, 0xA781, 0x6740, 0xA501, 0x65C0, 0x6480, 0xA441,
+    0x6C00, 0xACC1, 0xAD81, 0x6D40, 0xAF01, 0x6FC0, 0x6E80, 0xAE41,
+    0xAA01, 0x6AC0, 0x6B80, 0xAB41, 0x6900, 0xA9C1, 0xA881, 0x6840,
+    0x7800, 0xB8C1, 0xB981, 0x7940, 0xBB01, 0x7BC0, 0x7A80, 0xBA41,
+    0xBE01, 0x7EC0, 0x7F80, 0xBF41, 0x7D00, 0xBDC1, 0xBC81, 0x7C40,
+    0xB401, 0x74C0, 0x7580, 0xB541, 0x7700, 0xB7C1, 0xB681, 0x7640,
+    0x7200, 0xB2C1, 0xB381, 0x7340, 0xB101, 0x71C0, 0x7080, 0xB041,
+    0x5000, 0x90C1, 0x9181, 0x5140, 0x9301, 0x53C0, 0x5280, 0x9241,
+    0x9601, 0x56C0, 0x5780, 0x9741, 0x5500, 0x95C1, 0x9481, 0x5440,
+    0x9C01, 0x5CC0, 0x5D80, 0x9D41, 0x5F00, 0x9FC1, 0x9E81, 0x5E40,
+    0x5A00, 0x9AC1, 0x9B81, 0x5B40, 0x9901, 0x59C0, 0x5880, 0x9841,
+    0x8801, 0x48C0, 0x4980, 0x8941, 0x4B00, 0x8BC1, 0x8A81, 0x4A40,
+    0x4E00, 0x8EC1, 0x8F81, 0x4F40, 0x8D01, 0x4DC0, 0x4C80, 0x8C41,
+    0x4400, 0x84C1, 0x8581, 0x4540, 0x8701, 0x47C0, 0x4680, 0x8641,
+    0x8201, 0x42C0, 0x4380, 0x8341, 0x4100, 0x81C1, 0x8081, 0x4040
+};
+
+uint16_t calculateCRC16(const uint8_t *data, size_t length) {
+    uint16_t crc = 0xFFFF; 
+    for (size_t i = 0; i < length; ++i) {
+        crc = (crc >> 8) ^ crc16_ibm_table[(crc & 0xFF) ^ data[i]];
+    }
+    return crc;
+}
+
+void bqInitCommunication() {
+    BQ_UART_SERIAL.begin(BQ_UART_BAUDRATE, SERIAL_8N1);
+    BQ_UART_SERIAL.setTimeout(SERIAL_TIMEOUT_MS); 
+}
+
+BMSErrorCode_t sendFrame(const uint8_t *frame, size_t length) {
+    BQ_UART_SERIAL.write(frame, length);
+    BQ_UART_SERIAL.flush(); 
+    bqDelayUs(UART_TX_DELAY_US); 
+    return BMS_OK;
+}
+
+BMSErrorCode_t receiveFrame(uint8_t *buffer, size_t expected_length, uint32_t timeout_ms) {
+    unsigned long startTime = millis();
+    size_t bytesRead = 0;
+    if (expected_length == 0) return BMS_OK; // Nothing to read
+
+    while (bytesRead < expected_length && (millis() - startTime) < timeout_ms) {
+        if (BQ_UART_SERIAL.available()) {
+            buffer[bytesRead++] = BQ_UART_SERIAL.read();
+        }
+    }
+    if (bytesRead < expected_length) {
+        // BMS_DEBUG_PRINTF("Receive timeout: expected %d, got %d bytes in %lu ms\n", expected_length, bytesRead, millis() - startTime);
+        // Clear remaining buffer from UART to prevent old data carryover
+        while(BQ_UART_SERIAL.available()) BQ_UART_SERIAL.read();
+        return BMS_ERROR_COMM_TIMEOUT;
+    }
+    return BMS_OK;
+}
+
+BMSErrorCode_t buildAndSendFrame(uint8_t deviceID, uint16_t regAddr, const uint8_t *data, uint8_t dataLen, uint8_t frameType) {
+    uint8_t frame[MAX_COMMAND_FRAME_SIZE];
+    size_t frameIndex = 0;
+
+    uint8_t initByte = 0x80 | (frameType & 0x70); 
+    if ((frameType & 0x10) || (frameType == FRMWRT_REV_ALL_W) ) { 
+        if (dataLen > 0 && dataLen <= MAX_WRITE_DATA_BYTES) {
+            initByte |= (dataLen - 1) & 0x07; 
+        } else if (dataLen == 0) { 
+            initByte |= 0x00; 
+        }
+        if (frameType == FRMWRT_REV_ALL_W) initByte = FRMWRT_REV_ALL_W;
+    }
+    frame[frameIndex++] = initByte;
+
+    if (frameType == FRMWRT_SGL_R || frameType == FRMWRT_SGL_W) {
+        frame[frameIndex++] = deviceID;
+    }
+
+    frame[frameIndex++] = (regAddr >> 8) & 0xFF;
+    frame[frameIndex++] = regAddr & 0xFF;
+
+    if (frameType == FRMWRT_SGL_R || frameType == FRMWRT_STK_R || frameType == FRMWRT_ALL_R) {
+        if (dataLen == 0 || dataLen > MAX_READ_DATA_BYTES) return BMS_ERROR_INVALID_RESPONSE; 
+        frame[frameIndex++] = dataLen -1; 
+    } else if ((frameType & 0x10) || (frameType == FRMWRT_REV_ALL_W)) { 
+        if (data != nullptr && dataLen > 0) {
+            for (uint8_t i = 0; i < dataLen; ++i) {
+                if (frameIndex < MAX_COMMAND_FRAME_SIZE - 2) { 
+                    frame[frameIndex++] = data[i];
+                } else {
+                    BMS_DEBUG_PRINTLN("Error: Command frame buffer overflow during build.");
+                    return BMS_ERROR_UNKNOWN; 
+                }
+            }
+        }
+    }
+    
+    uint16_t crc = calculateCRC16(frame, frameIndex);
+    frame[frameIndex++] = crc & 0xFF;        
+    frame[frameIndex++] = (crc >> 8) & 0xFF; 
+
+    return sendFrame(frame, frameIndex);
+}
+
+BMSErrorCode_t bqWriteReg(uint8_t deviceID, uint16_t regAddr, uint64_t data, uint8_t numBytes, uint8_t frameType) {
+    if (numBytes == 0 || numBytes > MAX_WRITE_DATA_BYTES) {
+        return BMS_ERROR_INVALID_RESPONSE; 
+    }
+    uint8_t dataBytes[MAX_WRITE_DATA_BYTES];
+    for (int i = 0; i < numBytes; ++i) {
+        dataBytes[i] = (data >> (8 * (numBytes - 1 - i))) & 0xFF; 
+    }
+    return buildAndSendFrame(deviceID, regAddr, dataBytes, numBytes, frameType);
+}
+
+BMSErrorCode_t bqReadReg(uint8_t deviceID, uint16_t regAddr, uint8_t *readBuffer, uint8_t numBytesToRead, uint8_t frameType, uint32_t timeout_ms) {
+    if (numBytesToRead == 0 || numBytesToRead > MAX_READ_DATA_BYTES) {
+        return BMS_ERROR_INVALID_RESPONSE;
+    }
+
+    BMSErrorCode_t status = buildAndSendFrame(deviceID, regAddr, nullptr, numBytesToRead, frameType);
+    if (status != BMS_OK) return status;
+
+    size_t expectedResponseLength = SINGLE_DEVICE_RESPONSE_OVERHEAD + numBytesToRead;
+    uint8_t responseFrame[MAX_SINGLE_DEVICE_RESPONSE_SIZE]; // Use max possible size for a single response
+    if (expectedResponseLength > MAX_SINGLE_DEVICE_RESPONSE_SIZE) {
+        BMS_DEBUG_PRINTLN("Error: ReadReg expected response too large for buffer.");
+        return BMS_ERROR_UNKNOWN;
+    }
+    
+    status = receiveFrame(responseFrame, expectedResponseLength, timeout_ms);
+    if (status != BMS_OK) return status;
+
+    uint16_t received_crc = (uint16_t)(responseFrame[expectedResponseLength - 1] << 8) | responseFrame[expectedResponseLength - 2];
+    uint16_t calculated_crc = calculateCRC16(responseFrame, expectedResponseLength - 2);
+    if (received_crc != calculated_crc) {
+        BMS_DEBUG_PRINTF("ReadReg CRC mismatch! Exp: 0x%04X, Got: 0x%04X for Dev %d, Reg 0x%04X\n", calculated_crc, received_crc, deviceID, regAddr);
+        return BMS_ERROR_CRC;
+    }
+
+    // TODO: Verify response INIT byte, Device ID (if applicable), and Register Address
+    if ((responseFrame[0] & 0x80) == 0x80) { // Check if it's a command frame (bit 7 = 1)
+        BMS_DEBUG_PRINTLN("Error: Expected response frame, got command frame type.");
+        return BMS_ERROR_INVALID_RESPONSE;
+    }
+    if ((frameType == FRMWRT_SGL_R) && (responseFrame[1] != deviceID)) {
+        BMS_DEBUG_PRINTF("Error: Response from wrong device ID. Expected %d, Got %d\n", deviceID, responseFrame[1]);
+        return BMS_ERROR_INVALID_RESPONSE;
+    }
+    // Add more checks for REG_ADDR if needed
+
+    memcpy(readBuffer, &responseFrame[4], numBytesToRead); 
+    return BMS_OK;
+}
+
+BMSErrorCode_t bqBroadcastWrite(uint16_t regAddr, uint64_t data, uint8_t numBytes) {
+    return bqWriteReg(0, regAddr, data, numBytes, FRMWRT_ALL_W); 
+}
+
+BMSErrorCode_t bqStackWrite(uint16_t regAddr, uint64_t data, uint8_t numBytes) {
+    return bqWriteReg(0, regAddr, data, numBytes, FRMWRT_STK_W); 
+}
+
+BMSErrorCode_t bqStackRead(uint16_t regAddr, uint8_t *readBuffer, uint8_t numBytesPerDevice, uint32_t timeout_ms) {
+    if (numBytesPerDevice == 0 || numBytesPerDevice > MAX_READ_DATA_BYTES) return BMS_ERROR_INVALID_RESPONSE;
+
+    BMSErrorCode_t status = buildAndSendFrame(0, regAddr, nullptr, numBytesPerDevice, FRMWRT_STK_R); 
+    if (status != BMS_OK) return status;
+
+    size_t singleResponseLength = SINGLE_DEVICE_RESPONSE_OVERHEAD + numBytesPerDevice;
+    size_t totalExpectedLength = singleResponseLength * NUM_BQ79616_DEVICES;
+    
+    if (totalExpectedLength > MAX_STACK_RESPONSE_BUFFER_SIZE) {
+        BMS_DEBUG_PRINTLN("Error: StackRead total expected response too large for buffer.");
+        return BMS_ERROR_UNKNOWN;
+    }
+    uint8_t tempResponseFrame[MAX_STACK_RESPONSE_BUFFER_SIZE]; // Use a single large buffer
+
+    status = receiveFrame(tempResponseFrame, totalExpectedLength, timeout_ms);
+    if (status != BMS_OK) return status;
+
+    for (int i = 0; i < NUM_BQ79616_DEVICES; ++i) {
+        size_t offset = i * singleResponseLength;
+        uint16_t received_crc = (uint16_t)(tempResponseFrame[offset + singleResponseLength - 1] << 8) | tempResponseFrame[offset + singleResponseLength - 2];
+        uint16_t calculated_crc = calculateCRC16(&tempResponseFrame[offset], singleResponseLength - 2);
+
+        if (received_crc != calculated_crc) {
+            BMS_DEBUG_PRINTF("StackRead CRC mismatch for device in response sequence (index %d, reported DevID %d) Reg 0x%04X!\n", i, tempResponseFrame[offset+1], regAddr);
+            return BMS_ERROR_CRC;
+        }
+        // TODO: Verify responseFrame[offset + 0] (INIT byte), responseFrame[offset + 1] (Device ID)
+        memcpy(readBuffer + (i * numBytesPerDevice), &tempResponseFrame[offset + 4], numBytesPerDevice);
+    }
+    return BMS_OK;
+}
+
+BMSErrorCode_t bqBroadcastWriteReverse(uint16_t regAddr, uint64_t data, uint8_t numBytes) {
+    return bqWriteReg(0, regAddr, data, numBytes, FRMWRT_REV_ALL_W);
+}
+
+BMSErrorCode_t bqWakeUpBridge() {
+    BMS_DEBUG_PRINTLN("Waking up BQ79600 bridge...");
+    if (BQ_UART_SERIAL) BQ_UART_SERIAL.end();
+    bqDelayMs(1);
+    pinMode(BQ_UART_WAKE_PIN, OUTPUT);
+    digitalWrite(BQ_UART_WAKE_PIN, LOW);
+    bqDelayUs(WAKE_PING_DURATION_US);
+    digitalWrite(BQ_UART_WAKE_PIN, HIGH);
+    bqDelayMs(1); 
+    BQ_UART_SERIAL.begin(BQ_UART_BAUDRATE, SERIAL_8N1); 
+    BQ_UART_SERIAL.setTimeout(SERIAL_TIMEOUT_MS);
+    bqDelayMs(1); // Allow UART to settle
+
+    bqDelayUs(BQ79600_WAKE_TO_ACTIVE_US);
+    BMS_DEBUG_PRINTLN("BQ79600 WAKE ping sent.");
+    return BMS_OK;
+}
+
+BMSErrorCode_t bqWakeUpStack() {
+    BMS_DEBUG_PRINTLN("Commanding bridge to wake up BQ79616 stack...");
+    // Command BQ79600 to set its shadowed CONTROL1[SEND_WAKE]=1.
+    // The BQ79616's CONTROL1 is at 0x309.
+    BMSErrorCode_t status = bqWriteReg(BQ79600_BRIDGE_DEVICE_ID, CONTROL1, (1ULL << 5), 1, FRMWRT_SGL_W);
+    if (status != BMS_OK) {
+        BMS_DEBUG_PRINTLN("Failed to send WAKE_STACK command to bridge.");
+        return status;
+    }
+    bqDelayUs(STACK_WAKE_PROPAGATION_DELAY_US);
+    BMS_DEBUG_PRINTLN("Stack wake-up command sent.");
+    return BMS_OK;
+}
+
+BMSErrorCode_t bqAutoAddressStack() {
+    BMS_DEBUG_PRINTLN("Starting auto-addressing sequence...");
+    BMSErrorCode_t status;
+
+    BMS_DEBUG_PRINTLN("  DLL Sync (dummy writes)...");
+    for (uint16_t reg = OTP_ECC_DATAIN1; reg <= OTP_ECC_DATAIN8; ++reg) { 
+        status = bqBroadcastWrite(reg, 0x00, 1);
+        if (status != BMS_OK) { BMS_DEBUG_PRINTF("DLL Sync Write failed for reg 0x%X\n", reg); return status; }
+    }
+    
+    BMS_DEBUG_PRINTLN("  Enable auto-address mode...");
+    status = bqBroadcastWrite(CONTROL1, 0x01, 1); // Set ADDR_WR bit
+    if (status != BMS_OK) { BMS_DEBUG_PRINTLN("Enable auto-address mode failed"); return status; }
+
+    BMS_DEBUG_PRINTLN("  Setting device addresses...");
+    for (uint8_t i = 0; i < TOTAL_BQ_DEVICES; ++i) { // Bridge (0) + Slaves (1 to N)
+        status = bqBroadcastWrite(DIR0_ADDR, i, 1); 
+        if (status != BMS_OK) { BMS_DEBUG_PRINTF("Setting address %d failed\n", i); return status; }
+    }
+
+    BMS_DEBUG_PRINTLN("  Configure BQ79616s as stack devices...");
+    status = bqStackWrite(COMM_CTRL, 0x02, 1); // STACK_DEV=1, TOP_STACK=0 for all BQ79616s
+    if (status != BMS_OK) { BMS_DEBUG_PRINTLN("Configure stack devices failed"); return status; }
+
+    if (NUM_BQ79616_DEVICES > 0) {
+        BMS_DEBUG_PRINTLN("  Configure Top of Stack device...");
+        uint8_t tos_address = NUM_BQ79616_DEVICES; 
+        status = bqWriteReg(tos_address, COMM_CTRL, 0x03, 1, FRMWRT_SGL_W); // STACK_DEV=1, TOP_STACK=1
+        if (status != BMS_OK) { BMS_DEBUG_PRINTF("Configure ToS device (Addr %d) failed\n", tos_address); return status; }
+    }
+    // Set BQ79600 (Bridge, device ID 0) as base device
+    status = bqWriteReg(BQ79600_BRIDGE_DEVICE_ID, COMM_CTRL, 0x00, 1, FRMWRT_SGL_W); // STACK_DEV=0, TOP_STACK=0
+    if (status != BMS_OK) { BMS_DEBUG_PRINTLN("Configure bridge as base device failed"); return status; }
+
+    BMS_DEBUG_PRINTLN("  DLL Sync (dummy reads)...");
+    uint8_t dummyReadBuf[MAX_READ_DATA_BYTES]; 
+    for (uint16_t reg = OTP_ECC_DATAIN1; reg <= OTP_ECC_DATAIN8; ++reg) { 
+        status = bqStackRead(reg, dummyReadBuf, 1); 
+        if (status != BMS_OK && status != BMS_ERROR_CRC && status != BMS_ERROR_COMM_TIMEOUT) { 
+             BMS_DEBUG_PRINTF("Warning: Dummy stack read for DLL sync failed for reg 0x%X with status %d\n", reg, status);
+             // Not returning error here as per TI guide for dummy reads
+        }
+    }
+    
+    BMS_DEBUG_PRINTLN("  Resetting communication faults from auto-addressing...");
+    status = bqBroadcastWrite(FAULT_RST2, 0xFF, 1); // Reset all in FAULT_RST2
+    if (status != BMS_OK) { BMS_DEBUG_PRINTLN("Resetting FAULT_RST2 failed"); return status; }
+    status = bqBroadcastWrite(FAULT_RST1, 0xFF, 1); // Reset all in FAULT_RST1
+    if (status != BMS_OK) { BMS_DEBUG_PRINTLN("Resetting FAULT_RST1 failed"); return status; }
+
+
+    BMS_DEBUG_PRINTLN("Auto-addressing complete.");
+    return BMS_OK;
+}
+
+// In src/bq_comm.cpp -> bqConfigureBridgeForRing()
+BMSErrorCode_t bqConfigureBridgeForRing() {
+    BMS_DEBUG_PRINTLN("Configuring BQ79600 bridge for Ring Architecture...");
+    BMSErrorCode_t status;
+    uint8_t devConf1Val_read, devConf2Val_read;
+    uint8_t devConf1Val_write, devConf2Val_write;
+
+    status = bqReadReg(BQ79600_BRIDGE_DEVICE_ID, BQ79600_DEV_CONF1, &devConf1Val_read, 1, FRMWRT_SGL_R);
+    if (status != BMS_OK) { BMS_DEBUG_PRINTLN("Failed to read BQ79600_DEV_CONF1 for ring config"); return status;}
+    status = bqReadReg(BQ79600_BRIDGE_DEVICE_ID, BQ79600_DEV_CONF2, &devConf2Val_read, 1, FRMWRT_SGL_R);
+    if (status != BMS_OK) { BMS_DEBUG_PRINTLN("Failed to read BQ79600_DEV_CONF2 for ring config"); return status;}
+
+    // Configure DEV_CONF1: Enable NFAULT, TONE_RX. Preserve other bits.
+    devConf1Val_write = devConf1Val_read;
+    devConf1Val_write |= BQ79600_DEVCFG1_TONE_RX_EN_BIT; 
+    devConf1Val_write |= BQ79600_DEVCFG1_NFAULT_EN_BIT;  
+    // devConf1Val_write |= BQ79600_DEVCFG1_FCOMM_EN_BIT; // Optional
+
+    // Configure DEV_CONF2: Set Ring Mode, Enable Auto Comm Select. Preserve other bits.
+    devConf2Val_write = devConf2Val_read;
+    devConf2Val_write &= ~(0x03 << 4); // Clear current COMM_MODE bits (5:4)
+    devConf2Val_write |= BQ79600_DEVCFG2_COMM_MODE_RING; // Set COMM_MODE to Ring (10b)
+    devConf2Val_write |= BQ79600_DEVCFG2_AUTO_COMM_SEL_BIT; 
+
+    status = bqWriteReg(BQ79600_BRIDGE_DEVICE_ID, BQ79600_DEV_CONF1, devConf1Val_write, 1, FRMWRT_SGL_W);
+    if (status != BMS_OK) { BMS_DEBUG_PRINTLN("Failed to write BQ79600_DEV_CONF1 for ring config"); return status;}
+
+    status = bqWriteReg(BQ79600_BRIDGE_DEVICE_ID, BQ79600_DEV_CONF2, devConf2Val_write, 1, FRMWRT_SGL_W);
+    if (status != BMS_OK) { BMS_DEBUG_PRINTLN("Failed to write BQ79600_DEV_CONF2 for ring config"); return status;}
+
+    BMS_DEBUG_PRINTF("BQ79600 Ring Config: Wrote DEV_CONF1=0x%02X, DEV_CONF2=0x%02X\n", devConf1Val_write, devConf2Val_write);
+    return BMS_OK;
+}
+
+BMSErrorCode_t bqConfigureStackForHeartbeat() {
+    BMS_DEBUG_PRINTLN("Configuring BQ79616 stack for Heartbeat...");
+    uint8_t devConfVal = BQ79616_HEARTBEAT_CONFIG; 
+    // This assumes other bits in DEV_CONF (0x02) are 0 or their default is acceptable.
+    // For safety, a read-modify-write for stack is complex (read all, modify, write all).
+    // Direct stack write is common for such configurations if defaults are known.
+    BMSErrorCode_t status = bqStackWrite(DEV_CONF, devConfVal, 1); 
+    if (status != BMS_OK) {
+         BMS_DEBUG_PRINTLN("Failed to configure BQ79616 stack for Heartbeat.");
+    } else {
+        BMS_DEBUG_PRINTLN("BQ79616 stack configured for Heartbeat.");
+    }
+    return status;
+}
+
+BMSErrorCode_t bqSleepDevices() {
+    BMS_DEBUG_PRINTLN("Commanding all devices to SLEEP...");
+    BMSErrorCode_t status_stack, status_bridge;
+    // CONTROL1 (0x309 from B0_reg.h) bit 2 = GOTO_SLEEP for BQ79616
+    status_stack = bqBroadcastWrite(CONTROL1, (1ULL << 2), 1); 
+    if (status_stack != BMS_OK) {
+        BMS_DEBUG_PRINTLN("Failed to command BQ79616 stack to SLEEP.");
+    }
+    // BQ79600_CONTROL1 (0x0309 from bq79600_reg.h) bit 2 = GOTO_SLEEP for BQ79600
+    status_bridge = bqWriteReg(BQ79600_BRIDGE_DEVICE_ID, BQ79600_CONTROL1, BQ79600_CTRL1_GOTO_SLEEP_BIT, 1, FRMWRT_SGL_W);
+     if (status_bridge != BMS_OK) {
+        BMS_DEBUG_PRINTLN("Failed to command BQ79600 bridge to SLEEP.");
+    }
+    return (status_stack == BMS_OK && status_bridge == BMS_OK) ? BMS_OK : BMS_ERROR_UNKNOWN;
+}
+
+BMSErrorCode_t bqShutdownDevices() {
+    BMS_DEBUG_PRINTLN("Commanding all devices to SHUTDOWN...");
+    BMSErrorCode_t status_stack, status_bridge;
+    // CONTROL1 (0x309 from B0_reg.h) bit 3 = SHUTDOWN_CMD for BQ79616
+    status_stack = bqBroadcastWrite(CONTROL1, (1ULL << 3), 1); 
+    if (status_stack != BMS_OK) {
+        BMS_DEBUG_PRINTLN("Failed to command BQ79616 stack to SHUTDOWN.");
+    }
+    // BQ79600_CONTROL1 (0x0309 from bq79600_reg.h) bit 3 = GOTO_SHUTDOWN for BQ79600
+    status_bridge = bqWriteReg(BQ79600_BRIDGE_DEVICE_ID, BQ79600_CONTROL1, BQ79600_CTRL1_GOTO_SHUTDOWN_BIT, 1, FRMWRT_SGL_W);
+     if (status_bridge != BMS_OK) {
+        BMS_DEBUG_PRINTLN("Failed to command BQ79600 bridge to SHUTDOWN.");
+    }
+    return (status_stack == BMS_OK && status_bridge == BMS_OK) ? BMS_OK : BMS_ERROR_UNKNOWN;
+}
+
+void bqDelayUs(unsigned int us) {
+    delayMicroseconds(us);
+}
+
+void bqDelayMs(unsigned int ms) {
+    delay(ms);
+}
