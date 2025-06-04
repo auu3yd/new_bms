@@ -262,37 +262,29 @@ void action_startup() {
     status = bqBroadcastWrite(CONTROL1, 0x81, 1);
     if (status != BMS_OK) { g_bmsData.communicationFault = true; BMS_DEBUG_PRINTLN("Startup Error: Broadcast Write for ADDR_WR/DIR_SEL failed."); return; }
 
-    BMS_DEBUG_PRINTLN("Verifying stack CONTROL1 after broadcast 0x81...");
-    uint8_t stack_ctrl1_vals[NUM_BQ79616_DEVICES];
-    if (NUM_BQ79616_DEVICES > 0) {
-    status = bqStackRead(CONTROL1, stack_ctrl1_vals, 1);
-    if (status == BMS_OK) {
-        for (int k=0; k<NUM_BQ79616_DEVICES; ++k) {
-            BMS_DEBUG_PRINTF("  Stack Dev %d CONTROL1 = 0x%02X (Expected to include 0x81)\n", k+1, stack_ctrl1_vals[k]);
-            if ((stack_ctrl1_vals[k] & 0x81) != 0x81) {
-                BMS_DEBUG_PRINTLN("    ERROR: Stack CONTROL1 not correctly set for DIR_SEL and ADDR_WR!");
-                g_bmsData.communicationFault = true; // Major issue
-            }
-        }
-    } else {
-        BMS_DEBUG_PRINTLN("  ERROR: Failed to read stack CONTROL1 for verification!");
+    
+// --- Step 8: assign addresses --------------------------------------------
+BMS_DEBUG_PRINTLN("Step 8: Setting device addresses using DIR1_ADDR (0x307)…");
+for (uint8_t i = 0; i < TOTAL_BQ_DEVICES; ++i) {
+    status = bqBroadcastWrite(DIR1_ADDR, i, 1);
+    if (status != BMS_OK) {
+        BMS_DEBUG_PRINTF("Startup Error: Setting DIR1_ADDR=%d failed (status %d)\n",
+                         i, status);
         g_bmsData.communicationFault = true;
+        return;
     }
-    if (g_bmsData.communicationFault) return;
-    }
+    bqDelayUs(400);                 // ≥ tWAKE_PROPAGATION (≈300 µs)
+}
 
+// **MANDATORY** – exit auto-address mode so traffic resumes
+status = bqBroadcastWrite(CONTROL1, 0x80, 1);  // DIR_SEL=1, ADDR_WR=0
+if (status != BMS_OK) {
+    BMS_DEBUG_PRINTLN("Startup Error: Failed to clear ADDR_WR.");
+    g_bmsData.communicationFault = true;
+    return;
+}
+bqDelayUs(200);                    // give links time to reopen
 
-    // 8. Broadcast Write consecutively to address 0x307 (DIR1_ADDR) = 0,1,2,3...
-    // (Address 0 for BQ79600, 1 to N for BQ7961x)
-    // BQ79600's CONTROL1[ADDR_WR] was set in step 2.
-    BMS_DEBUG_PRINTLN("Step 8: Setting device addresses using DIR1_ADDR (0x307)...");
-    for (uint8_t i = 0; i < TOTAL_BQ_DEVICES; ++i) {
-        status = bqBroadcastWrite(DIR1_ADDR, i, 1); 
-        if (status != BMS_OK) { 
-            BMS_DEBUG_PRINTF("Startup Error: Setting address %d via DIR1_ADDR failed (status %d).\n", i, status);
-            g_bmsData.communicationFault = true; return; 
-        }
-    }
 
     // 9. Broadcast write 0x02 to address 0x308 (set BQ7961X-Q1 as stack device)
     BMS_DEBUG_PRINTLN("Step 9: Configure BQ79616s as stack devices (COMM_CTRL=0x02)...");
@@ -352,6 +344,24 @@ void action_startup() {
         if (!addressing_ok_ring) return;
     }
 
+    BMS_DEBUG_PRINTLN("Verifying stack CONTROL1 after broadcast 0x81...");
+    uint8_t stack_ctrl1_vals[NUM_BQ79616_DEVICES];
+    if (NUM_BQ79616_DEVICES > 0) {
+    status = bqStackRead(CONTROL1, stack_ctrl1_vals, 1);
+    if (status == BMS_OK) {
+        for (int k=0; k<NUM_BQ79616_DEVICES; ++k) {
+            BMS_DEBUG_PRINTF("  Stack Dev %d CONTROL1 = 0x%02X (Expected to include 0x81)\n", k+1, stack_ctrl1_vals[k]);
+            if ((stack_ctrl1_vals[k] & 0x81) != 0x81) {
+                BMS_DEBUG_PRINTLN("    ERROR: Stack CONTROL1 not correctly set for DIR_SEL and ADDR_WR!");
+                g_bmsData.communicationFault = true; // Major issue
+            }
+        }
+    } else {
+        BMS_DEBUG_PRINTLN("  ERROR: Failed to read stack CONTROL1 for verification!");
+        g_bmsData.communicationFault = true;
+    }
+    if (g_bmsData.communicationFault) return;
+    }
 
     // 13. Single device read to BQ79600-Q1, verify 0x2001 (DEV_CONF1) = 0x14
     BMS_DEBUG_PRINTLN("Step 13: Verifying BQ79600 DEV_CONF1 (0x2001)...");
