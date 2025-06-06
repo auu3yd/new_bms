@@ -8,11 +8,13 @@
 #include <math.h>        
 #include <string.h> 
 
+
 FSM_State_t g_currentState;
 // BMSOverallData_t g_bmsData; // Definition moved to bq_data.cpp
 
 unsigned long g_lastFsmRunTime = 0;
 unsigned long g_lastCanTransmitTime = 0;
+unsigned long fault_startup_error_entry_ts = 0;
 static unsigned long startup_attempt_timestamp = 0;
 
 void read_and_print_bq_control_register(const char* stage_msg, uint8_t dev_id, uint16_t reg_addr, const char* reg_name) {
@@ -49,7 +51,7 @@ void fsm_change_state(FSM_State_t newState) {
 }
 
 void fsm_init() {
-    BMS_DEBUG_PRINTLN("FSM Init");
+    Serial.println("FSM Init");
     memset(&g_bmsData, 0, sizeof(BMSOverallData_t)); // Initialize global BMS data
     initFaultHandler(); 
     bqInitCommunication(); 
@@ -88,7 +90,7 @@ void fsm_run() {
         case FSM_STATE_FAULT_CRITICAL: action_fault_critical(); break;
         case FSM_STATE_SHUTDOWN_PROCEDURE: action_shutdown_procedure(); break;
         case FSM_STATE_SYSTEM_OFF: action_system_off(); break;
-        default: BMS_DEBUG_PRINTLN("FSM: Unknown state in action dispatch!"); break;
+        default: Serial.println("FSM: Unknown state in action dispatch!"); break;
     }
 
     processBMSFaults(&g_bmsData); 
@@ -105,7 +107,7 @@ void fsm_run() {
         case FSM_STATE_SHUTDOWN_PROCEDURE: nextState = transition_shutdown_procedure(); break;
         case FSM_STATE_SYSTEM_OFF: nextState = transition_system_off(); break; 
         default:
-            BMS_DEBUG_PRINTLN("FSM: Unknown state in transition dispatch! Resetting to INITIAL.");
+            Serial.println("FSM: Unknown state in transition dispatch! Resetting to INITIAL.");
             nextState = FSM_STATE_INITIAL;
             break;
     }
@@ -159,273 +161,235 @@ float convertTemperatureToNtcVoltage(float temperatureC) {
 }
 
 BMSErrorCode_t applyEssentialStackConfigsForRecovery(){
-    BMS_DEBUG_PRINTLN("Applying essential stack configurations for recovery...");
+    Serial.println("Applying essential stack configurations for recovery...");
     BMSErrorCode_t status = BMS_OK;
     BMSErrorCode_t current_op_status;
 
     uint8_t reg_val_8bit = (uint8_t)(CELLS_PER_SLAVE - 1);
     current_op_status = bqStackWrite(ACTIVE_CELL, reg_val_8bit, 1);
-    if(current_op_status != BMS_OK) { BMS_DEBUG_PRINTLN("Recovery: Failed ACTIVE_CELL"); status = current_op_status;}
+    if(current_op_status != BMS_OK) { Serial.println("Recovery: Failed ACTIVE_CELL"); status = current_op_status;}
 
     // Read-modify-write for CONTROL2 is tricky for stack. Sample writes 0x01.
     current_op_status = bqStackWrite(CONTROL2, 0x01, 1); // TSREF_EN
-    if(current_op_status != BMS_OK) { BMS_DEBUG_PRINTLN("Recovery: Failed CONTROL2"); if(status == BMS_OK) status = current_op_status;}
+    if(current_op_status != BMS_OK) { Serial.println("Recovery: Failed CONTROL2"); if(status == BMS_OK) status = current_op_status;}
     
-    bqDelayMs(1); // For TSREF
+    delayMicroseconds(1); // For TSREF
 
     current_op_status = bqStackWrite(ADC_CTRL1, 0x0E, 1); // MAIN_GO=1, Continuous
-    if(current_op_status != BMS_OK) { BMS_DEBUG_PRINTLN("Recovery: Failed ADC_CTRL1"); if(status == BMS_OK) status = current_op_status;}
+    if(current_op_status != BMS_OK) { Serial.println("Recovery: Failed ADC_CTRL1"); if(status == BMS_OK) status = current_op_status;}
     
     // Re-enable protectors
     current_op_status = bqStackWrite(OVUV_CTRL, 0x07, 1); 
-    if(current_op_status != BMS_OK) { BMS_DEBUG_PRINTLN("Recovery: Failed OVUV_CTRL"); if(status == BMS_OK) status = current_op_status;}
+    if(current_op_status != BMS_OK) { Serial.println("Recovery: Failed OVUV_CTRL"); if(status == BMS_OK) status = current_op_status;}
     current_op_status = bqStackWrite(OTUT_CTRL, 0x05, 1); 
-    if(current_op_status != BMS_OK) { BMS_DEBUG_PRINTLN("Recovery: Failed OTUT_CTRL"); if(status == BMS_OK) status = current_op_status;}
+    if(current_op_status != BMS_OK) { Serial.println("Recovery: Failed OTUT_CTRL"); if(status == BMS_OK) status = current_op_status;}
 
     return status;
 }
-
 
 void action_initial() { }
 FSM_State_t transition_initial() { return FSM_STATE_STARTUP; }
 
 void action_startup() {
-    BMS_DEBUG_PRINTLN("Action: STARTUP (Ring Architecture Sequence)");
+    Serial.println("Action: STARTUP");
     BMSErrorCode_t status;
     uint8_t reg_val_8bit;
-    uint8_t dummy_read_buf[MAX_READ_DATA_BYTES]; // Max possible, though we read 1 byte for dummy
-    bool step_failed = false;
+    uint8_t dummy_read_buffer[MAX_READ_DATA_BYTES]; 
+    
+    g_bmsData.communicationFault = false; 
+    // fault_startup_error_entry_ts is managed by fsm_change_state
 
-    g_bmsData.communicationFault = false; // Reset for this attempt
-
-    // --- Ring Architecture Startup Sequence ---
+    bqShutdownDevices(); // Ensure all devices are in shutdown state before startup
+    delay(100); // Allow devices to settle after shutdown
 
     // 1. MCU sends WAKE ping to BQ79600-Q1.
-    BMS_DEBUG_PRINTLN("Step 1: Waking up BQ79600 bridge...");
+    Serial.println("[1] Waking up BQ79600 bridge...");
     status = bqWakeUpBridge();
-    if (status != BMS_OK) { g_bmsData.communicationFault = true; BMS_DEBUG_PRINTLN("Startup Error: Bridge wakeup failed."); return; }
-    bqDelayMs(10); // Allow bridge to fully wake
+    if (status != BMS_OK) { g_bmsData.communicationFault = true; Serial.println("Startup Error: Bridge wakeup failed."); return; }
+    delayMicroseconds(10); 
 
-    // 2. Single device write to BQ79600-Q1 CONTROL1 [DIR_SEL] = 1 (change BQ79600-Q1 direction to South/COMB)
-    BMS_DEBUG_PRINTLN("Step 2: Setting BQ79600 DIR_SEL = 1 (South/COMB)...");
-    // Read BQ79600.CONTROL1, modify DIR_SEL, write back
+    // 2. Single device write to BQ79600-Q1 CONTROL1 [SEND_WAKE] = 1 (wake up stack devices)
+    //    (BQ79600 CONTROL1 is 0x0309, SEND_WAKE is bit 5)
+
+    // TODO: Does BQWakeUpStack() not already do this? -- in which case, why isn't it being used?
+
+    // Serial.println("[2] Commanding bridge to wake up BQ79616 stack...");
+    // status = bqWakeUpStack();
+    // if (status != BMS_OK) { g_bmsData.communicationFault = true; Serial.println("Startup Error: Stack wakeup failed."); return; }
+    // delayMicroseconds(10); 
+    // Serial.println("[3] Auto Addressing...");
+    // status = bqAutoAddressStack();
+    // if (status != BMS_OK) { g_bmsData.communicationFault = true; Serial.println("Startup Error: Stack autoaddress failed."); return; }
+    // delayMicroseconds(10); 
+    // We need to read BQ79600.CONTROL1, set SEND_WAKE, and write it back.
+    // ADDR_WR on BQ79600 should also be set here for it to take address 0.
     uint8_t bq79600_ctrl1_val;
     status = bqReadReg(BQ79600_BRIDGE_DEVICE_ID, BQ79600_CONTROL1, &bq79600_ctrl1_val, 1, FRMWRT_SGL_R);
-    if (status != BMS_OK) { g_bmsData.communicationFault = true; BMS_DEBUG_PRINTLN("Startup Error: Failed to read BQ79600.CONTROL1 for DIR_SEL."); return; }
-    
-    bq79600_ctrl1_val |= BQ79600_CTRL1_DIR_SEL_BIT; // Set DIR_SEL to 1
-    // Also ensure BQ79600 is ready to accept its own address: set ADDR_WR = 1
-    // This is critical for step 8 where BQ79600 gets address 0.
-    // The BQ79616 sequence sets ADDR_WR on stack devices later.
-    // The BQ79600 needs it set before the broadcast address writes.
-    bq79600_ctrl1_val |= BQ79600_CTRL1_ADDR_WR_BIT; 
+    if (status != BMS_OK) { g_bmsData.communicationFault = true; Serial.println("Startup Error (Daisy S2): Failed to read BQ79600.CONTROL1 for SEND_WAKE."); return; }
+
+    bq79600_ctrl1_val |= BQ79600_CTRL1_SEND_WAKE_BIT; // Set SEND_WAKE
+    bq79600_ctrl1_val |= BQ79600_CTRL1_ADDR_WR_BIT;  // Enable ADDR_WR for BQ79600
 
     status = bqWriteReg(BQ79600_BRIDGE_DEVICE_ID, BQ79600_CONTROL1, bq79600_ctrl1_val, 1, FRMWRT_SGL_W);
-    if (status != BMS_OK) { g_bmsData.communicationFault = true; BMS_DEBUG_PRINTLN("Startup Error: Failed to write BQ79600.CONTROL1 for DIR_SEL/ADDR_WR."); return; }
-    read_and_print_bq_control_register("After BQ79600 DIR_SEL set", BQ79600_BRIDGE_DEVICE_ID, BQ79600_CONTROL1, "BQ79600_CONTROL1");
+    if (status != BMS_OK) { g_bmsData.communicationFault = true; Serial.println("Startup Error (Daisy S2): Stack wakeup command (SEND_WAKE/ADDR_WR) failed."); return; }
+    read_and_print_bq_control_register("After Daisy S2", BQ79600_BRIDGE_DEVICE_ID, BQ79600_CONTROL1, "BQ79600.CONTROL1");
+    delayMicroseconds(10 + STACK_WAKE_PROPAGATION_DELAY_US / 1000); 
 
-    // 3. Single device write to BQ79600-Q1 CONTROL1 [SEND_WAKE] = 1 (wake up stack devices)
-    // SEND_WAKE is self-clearing. It's fine to set it in the same register that has DIR_SEL.
-    BMS_DEBUG_PRINTLN("Step 3: Commanding bridge to wake up BQ79616 stack (via new direction)...");
-    // Value to write = existing BQ79600_CONTROL1 with SEND_WAKE set
-    // bq79600_ctrl1_val should still hold the value with DIR_SEL=1 and ADDR_WR=1
-    uint8_t wake_cmd_val = bq79600_ctrl1_val | BQ79600_CTRL1_SEND_WAKE_BIT; // Add SEND_WAKE
-    status = bqWriteReg(BQ79600_BRIDGE_DEVICE_ID, BQ79600_CONTROL1, wake_cmd_val, 1, FRMWRT_SGL_W);
-    if (status != BMS_OK) { g_bmsData.communicationFault = true; BMS_DEBUG_PRINTLN("Startup Error: Stack wakeup command failed."); return; }
-    bqDelayMs(10 + STACK_WAKE_PROPAGATION_DELAY_US / 1000); // Ensure sufficient delay
-
-    // Step 4 (Ring Sequence): Dummy stack write data 0x00 to registers 0x343 to 0x34A (OTP_ECC_DATAIN1 to OTP_ECC_DATAIN8)
-    BMS_DEBUG_PRINTLN("Step 4: Dummy stack writes for DLL sync (OTP_ECC_DATAIN1-8)...");
-    const uint16_t dummy_write_regs[] = {
+    // 3. Auto-Address (Daisy Chain / Northbound using DIR0_ADDR):
+    Serial.println("Daisy Step 3: Auto-Addressing Stack (Northbound)...");
+    
+    // 3a. Dummy broadcast writes to OTP_ECC_DATAIN1-8 (0x036B to 0x0372) for DLL sync.
+    //     Using the corrected defines from user: OTP_ECC_DATAIN1 (0x343) to OTP_ECC_DATAIN8 (0x34A)
+    Serial.println("  DLL Sync (dummy broadcast writes to OTP_ECC_DATAIN1-8)...");
+    const uint16_t dummy_dll_regs[] = {
         OTP_ECC_DATAIN1, OTP_ECC_DATAIN2, OTP_ECC_DATAIN3, OTP_ECC_DATAIN4,
         OTP_ECC_DATAIN5, OTP_ECC_DATAIN6, OTP_ECC_DATAIN7, OTP_ECC_DATAIN8
     };
     for (int k_reg = 0; k_reg < 8; ++k_reg) {
-        status = bqStackWrite(dummy_write_regs[k_reg], 0x00, 1);
-        if (status != BMS_OK) { 
-            BMS_DEBUG_PRINTF("Startup Warning: Dummy stack write to 0x%04X failed (status %d).\n", dummy_write_regs[k_reg], status);
-            // Don't necessarily fail startup for dummy write errors, but log.
-        }
+        status = bqBroadcastWrite(dummy_dll_regs[k_reg], 0x00, 1);
+        if (status != BMS_OK) { BMS_DEBUG_PRINTF("Startup Warning (Daisy S3a): Dummy broadcast write to 0x%04X failed.\n", dummy_dll_regs[k_reg]); }
     }
-    
-    // 5. Broadcast write reverse 0x80 to address 0x309 (change stack devices direction DIR_SEL =1)
-    BMS_DEBUG_PRINTLN("Step 5: Broadcast Reverse Write to set stack DIR_SEL = 1...");
-    // Data 0x80 sets Bit 7 (DIR_SEL) to 1 in CONTROL1 (0x309) of stack devices.
-    status = bqBroadcastWriteReverse(CONTROL1, 0x80, 1);
-    if (status != BMS_OK) { g_bmsData.communicationFault = true; BMS_DEBUG_PRINTLN("Startup Error: Broadcast Reverse Write for DIR_SEL failed."); return; }
 
-    // 6. (Skipping alleged step 6 "brdcast Write 0x02 to address 0x308(1)" as it's likely covered or misplaced)
+    // 3b. Broadcast write to BQ79616.CONTROL1 (0x0309) to set ADDR_WR=1.
+    Serial.println("  Enable ADDR_WR on stack devices (CONTROL1=0x01)...");
+    // Data 0x01 sets Bit 0 (ADDR_WR)=1 in BQ79616.CONTROL1. DIR_SEL (Bit 7) should be 0 for North.
+    status = bqBroadcastWrite(CONTROL1, 0x01, 1); 
+    if (status != BMS_OK) { g_bmsData.communicationFault = true; Serial.println("Startup Error (Daisy S3b): Broadcast Write for stack ADDR_WR failed."); return; }
+    delayMicroseconds(5);
 
-    // 7. Broadcast Write 0x81 to address 0x309 (enable BQ7961X-Q1 auto addressing: DIR_SEL=1, ADDR_WR=1)
-    BMS_DEBUG_PRINTLN("Step 7: Broadcast Write to enable stack auto-addressing (DIR_SEL=1, ADDR_WR=1)...");
-    // Data 0x81 writes to CONTROL1 (0x309) of stack devices. Sets Bit 7 (DIR_SEL)=1 and Bit 0 (ADDR_WR)=1.
-    status = bqBroadcastWrite(CONTROL1, 0x81, 1);
-    if (status != BMS_OK) { g_bmsData.communicationFault = true; BMS_DEBUG_PRINTLN("Startup Error: Broadcast Write for ADDR_WR/DIR_SEL failed."); return; }
-
-    
-// --- Step 8: assign addresses --------------------------------------------
-BMS_DEBUG_PRINTLN("Step 8: Setting device addresses using DIR1_ADDR (0x307)…");
-for (uint8_t i = 0; i < TOTAL_BQ_DEVICES; ++i) {
-    status = bqBroadcastWrite(DIR1_ADDR, i, 1);
-    if (status != BMS_OK) {
-        BMS_DEBUG_PRINTF("Startup Error: Setting DIR1_ADDR=%d failed (status %d)\n",
-                         i, status);
-        g_bmsData.communicationFault = true;
-        return;
-    }
-    bqDelayUs(400);                 // ≥ tWAKE_PROPAGATION (≈300 µs)
+    // 3c. Broadcast write sequential addresses to DIR0_ADDR (0x0306).
+    //     (Address 0 for bridge, 1 for first BQ79616, etc.)
+    //     BQ79600's CONTROL1[ADDR_WR] was set in Step 2.
+    /*  ----- 3c : write sequential addresses --------------------- */
+for (uint8_t i = 0; i < NUM_BQ79616_DEVICES; ++i) {
+    bqBroadcastWrite(DIR0_ADDR, i + 1, 1);   // addr 1, 2, …
 }
 
-// **MANDATORY** – exit auto-address mode so traffic resumes
-status = bqBroadcastWrite(CONTROL1, 0x80, 1);  // DIR_SEL=1, ADDR_WR=0
-if (status != BMS_OK) {
-    BMS_DEBUG_PRINTLN("Startup Error: Failed to clear ADDR_WR.");
-    g_bmsData.communicationFault = true;
-    return;
-}
-bqDelayUs(200);                    // give links time to reopen
+/*  NEW — Step 4: exit address-write mode  */
+bqBroadcastWrite(CONTROL1, 0x00, 1);         // ADDR_WR = 0
+delayMicroseconds(150);                      // ≥100 µs guard time
+/*  ----------------------------------------------------------- */
 
+/*  ----- 3d : put devices into stack mode -------------------- */
+bqBroadcastWrite(COMM_CTRL, 0x02, 1);         // STACK_DEV = 1
 
-    // 9. Broadcast write 0x02 to address 0x308 (set BQ7961X-Q1 as stack device)
-    BMS_DEBUG_PRINTLN("Step 9: Configure BQ79616s as stack devices (COMM_CTRL=0x02)...");
-    // Data 0x02 (STACK_DEV=1, TOP_STACK=0) to COMM_CTRL (0x308) of stack devices.
-    status = bqBroadcastWrite(COMM_CTRL, 0x02, 1); // Note: bqBroadcastWrite targets ALL, including bridge.
-                                                    // Bridge COMM_CTRL should be set by SGL_W later.
-    if (status != BMS_OK) { g_bmsData.communicationFault = true; BMS_DEBUG_PRINTLN("Startup Error: Broadcast write for BQ79616 COMM_CTRL failed."); return; }
+    // 3d. Set COMM_CTRL (0x0308) for bridge, stack devices, and ToS.
+    Serial.println("  Configure BQ79616s as stack devices (COMM_CTRL=0x02)...");
+    status = bqBroadcastWrite(COMM_CTRL, 0x02, 1); // STACK_DEV=1, TOP_STACK=0 for BQ79616s
+    delayMicroseconds(100);
+    if (status != BMS_OK) { g_bmsData.communicationFault = true; Serial.println("Startup Error (Daisy S3d): Broadcast write for BQ79616 COMM_CTRL failed."); return; }
 
-    // 10. Single device write to device N (last BQ79616): data 0x03 to address 0x308 (set as top of stack)
-    //     And set BQ79600-Q1 (device 0) COMM_CTRL to 0x00 (base).
     if (NUM_BQ79616_DEVICES > 0) {
-        uint8_t tos_address = NUM_BQ79616_DEVICES; // Address of the last BQ79616
-        BMS_DEBUG_PRINTF("Step 10a: Configure ToS device (Addr %d) COMM_CTRL=0x03...\n", tos_address);
-        status = bqWriteReg(tos_address, COMM_CTRL, 0x03, 1, FRMWRT_SGL_W); // STACK_DEV=1, TOP_STACK=1
-        if (status != BMS_OK) { BMS_DEBUG_PRINTF("Startup Error: Configure ToS device (Addr %d) failed.\n", tos_address); g_bmsData.communicationFault = true; return; }
+        uint8_t tos_address = NUM_BQ79616_DEVICES; 
+        BMS_DEBUG_PRINTF("  Configure ToS device (Addr %d) COMM_CTRL=0x03...\n", tos_address);
+        status = bqWriteReg(tos_address, COMM_CTRL, 0x03, 1, FRMWRT_SGL_W); 
+        delayMicroseconds(100);
+        if (status != BMS_OK) { BMS_DEBUG_PRINTF("Startup Error (Daisy S3d): Configure ToS device (Addr %d) failed.\n", tos_address); g_bmsData.communicationFault = true; return; }
     }
-    BMS_DEBUG_PRINTLN("Step 10b: Configure BQ79600 (Addr 0) as base (COMM_CTRL=0x00)...");
-    status = bqWriteReg(BQ79600_BRIDGE_DEVICE_ID, COMM_CTRL, 0x00, 1, FRMWRT_SGL_W); // STACK_DEV=0, TOP_STACK=0
-    if (status != BMS_OK) { BMS_DEBUG_PRINTLN("Startup Error: Configure bridge as base device failed."); g_bmsData.communicationFault = true; return; }
+    Serial.println("  Configure BQ79600 (Addr 0) as base (COMM_CTRL=0x00)...");
+    status = bqWriteReg(BQ79600_BRIDGE_DEVICE_ID, COMM_CTRL, 0x00, 1, FRMWRT_SGL_W); 
+    delayMicroseconds(100);
+    if (status != BMS_OK) { Serial.println("Startup Error (Daisy S3d): Configure bridge as base device failed."); g_bmsData.communicationFault = true; return; }
 
-
-    // Step 11 (Ring Sequence): Dummy stack read registers 0x343 to 0x34A (OTP_ECC_DATAIN1 to OTP_ECC_DATAIN8)
-    BMS_DEBUG_PRINTLN("Step 11: Dummy stack reads for DLL sync (OTP_ECC_DATAIN1-8)...");
-    const uint16_t dummy_read_regs[] = { // Same registers as for write
-        OTP_ECC_DATAIN1, OTP_ECC_DATAIN2, OTP_ECC_DATAIN3, OTP_ECC_DATAIN4,
-        OTP_ECC_DATAIN5, OTP_ECC_DATAIN6, OTP_ECC_DATAIN7, OTP_ECC_DATAIN8
-    };
+    // 3e. Dummy stack reads from OTP_ECC_DATAIN1-8.
+    Serial.println("  DLL Sync (dummy stack reads OTP_ECC_DATAIN1-8)...");
     for (int k_reg = 0; k_reg < 8; ++k_reg) {
-        status = bqStackRead(dummy_read_regs[k_reg], dummy_read_buf, 1); 
+        status = bqStackRead(dummy_dll_regs[k_reg], dummy_read_buffer, 1); 
         if (status != BMS_OK && status != BMS_ERROR_CRC && status != BMS_ERROR_COMM_TIMEOUT) { 
-             BMS_DEBUG_PRINTF("Startup Warning: Dummy stack read from 0x%04X failed (status %d).\n", dummy_read_regs[k_reg], status);
+             BMS_DEBUG_PRINTF("Startup Warning (Daisy S3e): Dummy stack read from 0x%04X failed.\n", dummy_dll_regs[k_reg]);
         }
     }
 
-    // 12. Stack read address 0x307 (DIR1_ADDR) to verify addresses.
-    BMS_DEBUG_PRINTLN("Step 12: Verifying stack device addresses (DIR1_ADDR)...");
-    bool addressing_ok_ring = true;
-    uint8_t addr_read_buffer[NUM_BQ79616_DEVICES]; // Buffer for stack read
+    // 3f. Verify Auto-Addressing by reading DIR0_ADDR from stack devices
+    Serial.println("  Verifying stack device addresses (DIR0_ADDR)...");
+    bool addressing_ok = true;
+    /* buffer order after broadcast read is ToS → ... → bridge */
+    uint8_t addr_read_buffer[NUM_BQ79616_DEVICES + 1];
     if (NUM_BQ79616_DEVICES > 0) {
-        status = bqStackRead(DIR1_ADDR, addr_read_buffer, 1); // Read 1 byte per BQ79616 device
+        status = bqBroadcastRead(DIR0_ADDR,
+                                 addr_read_buffer,
+                                 1,
+                                 SERIAL_TIMEOUT_MS * (NUM_BQ79616_DEVICES + 1));
         if (status != BMS_OK) {
-            BMS_DEBUG_PRINTLN("Startup Error: Stack read for DIR1_ADDR verification failed.");
-            addressing_ok_ring = false;
+            Serial.println("Startup Error (Daisy S3f): Broadcast read for DIR0_ADDR verification failed.");
+            addressing_ok = false;
             g_bmsData.communicationFault = true;
         } else {
-            for (uint8_t i = 0; i < NUM_BQ79616_DEVICES; ++i) {
-                uint8_t expected_addr = i + 1;
-                if (addr_read_buffer[i] != expected_addr) {
-                    BMS_DEBUG_PRINTF("ERROR: Ring Addr Verify: BQ79616 Index %d (Expected Addr %d) reported DIR1_ADDR %d\n", i, expected_addr, addr_read_buffer[i]);
-                    addressing_ok_ring = false;
-                    g_bmsData.communicationFault = true;
-                } else {
-                     BMS_DEBUG_PRINTF("Ring Addr Verify: BQ79616 Index %d (Addr %d) DIR1_ADDR OK: %d\n", i, expected_addr, addr_read_buffer[i]);
-                }
+                      /* frame[0] = ToS (addr = NUM_BQ79616_DEVICES), so flip index */
+            for (uint8_t idx = 0; idx < NUM_BQ79616_DEVICES; ++idx) {
+                uint8_t frame      = addr_read_buffer[idx];
+                uint8_t exp_addr   = NUM_BQ79616_DEVICES - idx;  /* ToS, …, 1 */
+                if (frame != exp_addr) {
+                   BMS_DEBUG_PRINTF("ERROR (S3f): device exp %d got 0x%02X\n",
+                                      exp_addr, frame);
+                   addressing_ok = false;
+               } else 
+               {                    BMS_DEBUG_PRINTF("S3f OK: device addr %d present\n", frame);
+               }
             }
-        }
-        if (!addressing_ok_ring) return;
     }
-
-    BMS_DEBUG_PRINTLN("Verifying stack CONTROL1 after broadcast 0x81...");
-    uint8_t stack_ctrl1_vals[NUM_BQ79616_DEVICES];
-    if (NUM_BQ79616_DEVICES > 0) {
-    status = bqStackRead(CONTROL1, stack_ctrl1_vals, 1);
+}
+    // Verify BQ79600 address
+    uint8_t bridge_dir0_addr;
+    status = bqReadReg(BQ79600_BRIDGE_DEVICE_ID, DIR0_ADDR, &bridge_dir0_addr, 1, FRMWRT_SGL_R);
     if (status == BMS_OK) {
-        for (int k=0; k<NUM_BQ79616_DEVICES; ++k) {
-            BMS_DEBUG_PRINTF("  Stack Dev %d CONTROL1 = 0x%02X (Expected to include 0x81)\n", k+1, stack_ctrl1_vals[k]);
-            if ((stack_ctrl1_vals[k] & 0x81) != 0x81) {
-                BMS_DEBUG_PRINTLN("    ERROR: Stack CONTROL1 not correctly set for DIR_SEL and ADDR_WR!");
-                g_bmsData.communicationFault = true; // Major issue
-            }
-        }
-    } else {
-        BMS_DEBUG_PRINTLN("  ERROR: Failed to read stack CONTROL1 for verification!");
-        g_bmsData.communicationFault = true;
-    }
-    if (g_bmsData.communicationFault) return;
-    }
-
-    // 13. Single device read to BQ79600-Q1, verify 0x2001 (DEV_CONF1) = 0x14
-    BMS_DEBUG_PRINTLN("Step 13: Verifying BQ79600 DEV_CONF1 (0x2001)...");
-    uint8_t bq79600_dev_conf1_val;
-    status = bqReadReg(BQ79600_BRIDGE_DEVICE_ID, BQ79600_DEV_CONF1, &bq79600_dev_conf1_val, 1, FRMWRT_SGL_R);
-    if (status != BMS_OK) {
-        BMS_DEBUG_PRINTLN("Startup Error: Failed to read BQ79600 DEV_CONF1.");
-        g_bmsData.communicationFault = true; return;
-    } else {
-        if (bq79600_dev_conf1_val == 0x14) {
-            BMS_DEBUG_PRINTF("BQ79600 DEV_CONF1 verified: 0x%02X\n", bq79600_dev_conf1_val);
+        if (bridge_dir0_addr == BQ79600_BRIDGE_DEVICE_ID) {
+            BMS_DEBUG_PRINTF("Daisy S3f: Bridge Addr %d DIR0_ADDR OK: 0x%02X\n", BQ79600_BRIDGE_DEVICE_ID, bridge_dir0_addr);
         } else {
-            BMS_DEBUG_PRINTF("Startup Warning: BQ79600 DEV_CONF1 = 0x%02X (Expected 0x14).\n", bq79600_dev_conf1_val);
-            // This might not be a fatal error for communication, but a configuration note.
+            BMS_DEBUG_PRINTF("ERROR (Daisy S3f): Bridge Addr %d reported DIR0_ADDR 0x%02X\n", BQ79600_BRIDGE_DEVICE_ID, bridge_dir0_addr);
+            addressing_ok = false; g_bmsData.communicationFault = true;
         }
+    } else {
+        Serial.println("Startup Error (Daisy S3f): Failed to read Bridge DIR0_ADDR.");
+        addressing_ok = false; g_bmsData.communicationFault = true;
     }
+    if (!addressing_ok) return;
 
-    BMS_DEBUG_PRINTLN("Core Ring Architecture Startup Sequence Complete.");
-    if (g_bmsData.communicationFault) return; // Check if any step above set the fault
 
-    // --- Now proceed with other initializations ---
-    BMS_DEBUG_PRINTLN("Configuring Stack Heartbeat...");
-    status = bqConfigureStackForHeartbeat(); 
-    if (status != BMS_OK) { g_bmsData.communicationFault = true; BMS_DEBUG_PRINTLN("Startup Error: Stack heartbeat config failed."); return; }
-
-    BMS_DEBUG_PRINTLN("Starting detailed BQ79616 stack configurations...");
-    // (The detailed BQ79616 configuration writes: ACTIVE_CELL, CONTROL2 for TSREF, GPIOs, Thresholds, Protectors, ADCs, Balancing defaults, COMM_TIMEOUT_CONF)
-    // This block of code needs to be re-inserted here carefully, using bqStackWrite.
-    // Example for one:
-    reg_val_8bit = (uint8_t)(CELLS_PER_SLAVE - 1);
-    status = bqStackWrite(ACTIVE_CELL, reg_val_8bit, 1);
-    if (status != BMS_OK) { BMS_DEBUG_PRINTLN("Failed to set ACTIVE_CELL"); g_bmsData.communicationFault = true; return; }
+    // 3g. Broadcast write to FAULT_RST1 & FAULT_RST2 to clear communication faults.
+    // (This is done by resetAllBQFaults later, but example did it here too)
+    Serial.println("  Resetting stack comm faults (FAULT_RST1/2)...");
+    //Serial.println("Daisy Step 3: Auto-Addressing Complete.");
+    //if (g_bmsData.communicationFault) return;
     
-    // TSREF_EN in CONTROL2 (for BQ79616 devices)
-    status = bqStackWrite(CONTROL2, (1 << 0), 1); // Set TSREF_EN on stack devices
-    if (status != BMS_OK) { BMS_DEBUG_PRINTLN("Failed to set stack CONTROL2 (TSREF_EN)"); g_bmsData.communicationFault = true; return; }
-    bqDelayMs(10);
 
-    // ... Add all other detailed BQ79616 stack configurations here, ensuring each uses bqStackWrite ...
-    // (GPIO_CONF, OV_THRESH, UV_THRESH, OTUT_THRESH, FAULT_MSK1/2, OVUV_CTRL, OTUT_CTRL, ADC_CONF1/2, ADC_CTRL1/3, BAL_CTRL1/2, COMM_TIMEOUT_CONF)
-    // Ensure error checking for each.
+    // -----------------------------------------------------------------------------------------------------------
+    // all the stuff above this, I think there is already a function for. I need to compare the two but will do it later
+    // -----------------------------------------------------------------------------------------------------------
 
-    if (g_bmsData.communicationFault) {
-        BMS_DEBUG_PRINTLN("Startup Error: Failure during detailed BQ79616 configuration.");
-        return; 
-    }
-    
-    bqDelayMs(20); 
+    // 4. Set Registers (Detailed BQ79616 Configurations)
+    // TODO: I think this should end up either refactored or rewritten to be more readable. 
+    // This is one of those things I want to be able to change one day (and probably evaluate how our .h files are set up)
 
-    BMS_DEBUG_PRINTLN("Resetting all BQ device faults post-configuration...");
+    Serial.println("[4] Configuring Stack...");
+    // status = bqConfigureStackForHeartbeat(); 
+    // if (status != BMS_OK) { g_bmsData.communicationFault = true; Serial.println("Startup Error (Daisy S4): Stack heartbeat config failed."); return; }
+
+    // this replaced the pile of gemini code that was here before
+    bool retFlag;
+    configure_stack(reg_val_8bit, status, retFlag);
+    if (retFlag)
+        return;
+
+    // 5. Final Fault Reset
+    Serial.println("[5] Resetting all BQ device faults post-configuration...");
     status = resetAllBQFaults(); 
     if (status != BMS_OK) {
-        BMS_DEBUG_PRINTLN("Startup Warning: Failed to reset BQ faults post-configuration.");
+        Serial.println("Startup Warning (Daisy S5): Failed to reset BQ faults post-configuration.");
     }
     
-    BMS_DEBUG_PRINTLN("Full Startup Sequence (Ring) seemingly complete.");
+    Serial.println("Startup sequence complete. ");
     g_bmsData.balancing_request = false; 
     g_bmsData.balancing_cycle_active = false;
     for(int i=0; i<NUM_BQ79616_DEVICES; ++i) g_bmsData.activeBalancingCells[i] = 0;
     
-    // Final check of BQ79600 CONTROL1 (should show DIR_SEL=1, ADDR_WR might be 0 now)
-    read_and_print_bq_control_register("End of Startup", BQ79600_BRIDGE_DEVICE_ID, BQ79600_CONTROL1, "BQ79600_CONTROL1");
-}
+    // Print some final states for BQ79600
+    // read_and_print_bq_control_register("End of Daisy Startup", BQ79600_BRIDGE_DEVICE_ID, BQ79600_CONTROL1, "BQ79600.CONTROL1");
+    // read_and_print_bq_control_register("End of Daisy Startup", BQ79600_BRIDGE_DEVICE_ID, BQ79600_DEV_CONF1, "BQ79600.DEV_CONF1");
+    // For Daisy Chain, BQ79600 CONTROL2 is not critical for mode, but can print for info
 
+    // The function verify_stack_communication_after_startup() in transition_startup will do a final check.
+}
 
 FSM_State_t transition_startup() {
     if (g_bmsData.communicationFault) { // If action_startup set this due to a failure
@@ -435,23 +399,13 @@ FSM_State_t transition_startup() {
     if (g_faultState.bridge_comm_fault_confirmed || g_faultState.comm_fault_confirmed) {
         return FSM_STATE_FAULT_STARTUP_ERROR;
     }
-    BMS_DEBUG_PRINTLN("Startup successful, transitioning to Normal Operation.");
+    Serial.println("Startup successful, transitioning to Normal Operation.");
     return FSM_STATE_NORMAL_OPERATION;
 }
 
 void action_normal_operation() {
     BMSErrorCode_t status;
     bool current_cycle_comm_ok = true;
-
-    // In fsm.cpp, at the very beginning of action_normal_operation()
-uint8_t normal_op_dev_conf2;
-BMSErrorCode_t normal_op_read_status = bqReadReg(BQ79600_BRIDGE_DEVICE_ID, BQ79600_DEV_CONF2, &normal_op_dev_conf2, 1, FRMWRT_SGL_R);
-if (normal_op_read_status == BMS_OK) {
-    BMS_DEBUG_PRINTF("Start of Normal Op: DEV_CONF2 = 0x%02X\n", normal_op_dev_conf2);
-} else {
-    BMS_DEBUG_PRINTLN("Start of Normal Op: Failed to read DEV_CONF2!");
-}
-
 
     status = bqGetAllCellVoltages(&g_bmsData);
     if (status != BMS_OK) current_cycle_comm_ok = false;
@@ -512,7 +466,7 @@ FSM_State_t transition_normal_operation() {
         return FSM_STATE_FAULT_MEASUREMENT;
     }
     if (g_faultState.unspecified_n_fault_confirmed) {
-        BMS_DEBUG_PRINTLN("Transitioning to FAULT_CRITICAL due to unspecified NFAULT assertion.");
+        Serial.println("Transitioning to FAULT_CRITICAL due to unspecified NFAULT assertion.");
         return FSM_STATE_FAULT_CRITICAL; 
     }
     if (g_bmsData.balancing_request && !g_bmsData.balancing_cycle_active) { // Request and not already in a cycle from last time
@@ -520,14 +474,14 @@ FSM_State_t transition_normal_operation() {
     }
     // no fucking clue why this is here but whatev
     // if (g_bmsData.reset_pin_active) { 
-    //     BMS_DEBUG_PRINTLN("Reset pin detected, initiating shutdown.");
+    //     Serial.println("Reset pin detected, initiating shutdown.");
     //     return FSM_STATE_SHUTDOWN_PROCEDURE;
     // }
     return FSM_STATE_NORMAL_OPERATION;
 }
 
 void action_cell_balancing() {
-    // BMS_DEBUG_PRINTLN("Action: CELL_BALANCING");
+    // Serial.println("Action: CELL_BALANCING");
     BMSErrorCode_t comm_status;
     bool current_cycle_comm_ok = true;
 
@@ -658,7 +612,7 @@ FSM_State_t transition_cell_balancing() {
     }
 
     if (!any_cell_still_active && (max_v_overall - min_v_overall <= TARGET_BALANCED_VOLTAGE_DIFF_MV)) {
-        BMS_DEBUG_PRINTLN("Cell balancing complete. Pack delta <= target.");
+        Serial.println("Cell balancing complete. Pack delta <= target.");
         g_bmsData.balancing_request = false;
         g_bmsData.balancing_cycle_active = false;
         return FSM_STATE_NORMAL_OPERATION;
@@ -666,11 +620,11 @@ FSM_State_t transition_cell_balancing() {
     
     if (!any_cell_still_active && !g_bmsData.balancing_cycle_active) { 
         if ((max_v_overall - min_v_overall) <= CELL_BALANCE_VOLTAGE_DIFF_THRESHOLD_MV) { // Not much more to do
-             BMS_DEBUG_PRINTLN("Cell balancing paused (delta small or no eligible cells).");
+             Serial.println("Cell balancing paused (delta small or no eligible cells).");
              g_bmsData.balancing_request = false; 
              return FSM_STATE_NORMAL_OPERATION;
         } else if (max_v_overall >= MAX_VOLTAGE_FOR_BALANCING_MV || min_v_overall <= MIN_VOLTAGE_FOR_BALANCING_MV){
-            BMS_DEBUG_PRINTLN("Cell balancing paused (voltages out of safe balancing range).");
+            Serial.println("Cell balancing paused (voltages out of safe balancing range).");
             g_bmsData.balancing_request = false;
             return FSM_STATE_NORMAL_OPERATION;
         }
@@ -681,19 +635,19 @@ FSM_State_t transition_cell_balancing() {
         return FSM_STATE_CELL_BALANCING; 
     }
     // Default to normal operation if no longer requested and no cycle active
-    BMS_DEBUG_PRINTLN("Exiting cell balancing as no longer requested or active.");
+    Serial.println("Exiting cell balancing as no longer requested or active.");
     g_bmsData.balancing_request = false;
     g_bmsData.balancing_cycle_active = false;
     return FSM_STATE_NORMAL_OPERATION;
 }
 
 void action_fault_communication() {
-    BMS_DEBUG_PRINTLN("Action: FAULT_COMMUNICATION");
+    Serial.println("Action: FAULT_COMMUNICATION");
     
     if (g_faultState.comm_fault_retries < 3) {
         BMS_DEBUG_PRINTF("Attempting communication fault recovery (Retry %d)...\n", g_faultState.comm_fault_retries + 1);
         
-        BMS_DEBUG_PRINTLN("Performing full stack re-initialization for recovery...");
+        Serial.println("Performing full stack re-initialization for recovery...");
         BMSErrorCode_t status_recovery = BMS_OK;
         
         if(bqWakeUpBridge() != BMS_OK) status_recovery = BMS_ERROR_WAKEUP_FAILED;
@@ -706,20 +660,20 @@ void action_fault_communication() {
         if (status_recovery == BMS_OK) {
             BMSErrorCode_t reset_status = resetAllBQFaults(); 
             if(reset_status == BMS_OK){
-                BMS_DEBUG_PRINTLN("Recovery: BQ faults cleared. Software confirmed faults also cleared.");
+                Serial.println("Recovery: BQ faults cleared. Software confirmed faults also cleared.");
                 // resetAllBQFaults now also clears software confirmed flags and timers.
                 // We need to re-evaluate if underlying comms issue is resolved.
                 // Forcing a clear of immediate bmsData.communicationFault to allow next cycle check.
                 g_bmsData.communicationFault = false; 
             } else {
-                BMS_DEBUG_PRINTLN("Recovery: Failed to reset BQ faults.");
+                Serial.println("Recovery: Failed to reset BQ faults.");
             }
         } else {
              BMS_DEBUG_PRINTF("Recovery: Re-initialization failed with code %d.\n", status_recovery);
         }
         g_faultState.comm_fault_retries++;
     } else {
-         BMS_DEBUG_PRINTLN("Communication fault persists after max retries during FSM fault state.");
+         Serial.println("Communication fault persists after max retries during FSM fault state.");
     }
 }
 
@@ -727,34 +681,34 @@ FSM_State_t transition_fault_communication() {
     // processBMSFaults will update confirmed flags based on current state of g_bmsData.communicationFault etc.
     // If recovery was successful, g_bmsData.communicationFault would be false, leading to g_faultState flags clearing.
     if (!g_faultState.comm_fault_confirmed && !g_faultState.bridge_comm_fault_confirmed && !g_faultState.stack_heartbeat_fault_confirmed) {
-        BMS_DEBUG_PRINTLN("Comm fault condition appears resolved after recovery attempt. Transitioning to STARTUP.");
+        Serial.println("Comm fault condition appears resolved after recovery attempt. Transitioning to STARTUP.");
         g_faultState.comm_fault_retries = 0; 
         return FSM_STATE_STARTUP; 
     }
     if(g_faultState.comm_fault_retries >= 3 && 
        (g_faultState.comm_fault_confirmed || g_faultState.bridge_comm_fault_confirmed || g_faultState.stack_heartbeat_fault_confirmed) ) { 
-        BMS_DEBUG_PRINTLN("Max comm recovery retries reached, escalating to CRITICAL FAULT.");
+        Serial.println("Max comm recovery retries reached, escalating to CRITICAL FAULT.");
         return FSM_STATE_FAULT_CRITICAL; 
     }
     return FSM_STATE_FAULT_COMMUNICATION; 
 }
 
 void action_fault_measurement() {
-    BMS_DEBUG_PRINTLN("Action: FAULT_MEASUREMENT (OV/UV/OT/UT)");
-    if(g_faultState.ovuv_fault_confirmed) BMS_DEBUG_PRINTLN("Confirmed OV/UV Fault Active!");
-    if(g_faultState.otut_fault_confirmed) BMS_DEBUG_PRINTLN("Confirmed OT/UT Fault Active!");
+    Serial.println("Action: FAULT_MEASUREMENT (OV/UV/OT/UT)");
+    if(g_faultState.ovuv_fault_confirmed) Serial.println("Confirmed OV/UV Fault Active!");
+    if(g_faultState.otut_fault_confirmed) Serial.println("Confirmed OT/UT Fault Active!");
 }
 
 FSM_State_t transition_fault_measurement() {
     if (!g_faultState.ovuv_fault_confirmed && !g_faultState.otut_fault_confirmed) {
-        BMS_DEBUG_PRINTLN("Measurement fault condition cleared.");
+        Serial.println("Measurement fault condition cleared.");
         return FSM_STATE_NORMAL_OPERATION;
     }
     return FSM_STATE_FAULT_MEASUREMENT; 
 }
 
 void action_fault_startup_error() {
-    BMS_DEBUG_PRINTLN("Action: FAULT_STARTUP_ERROR - System initialization failed.");
+    Serial.println("Action: FAULT_STARTUP_ERROR - System initialization failed.");
     delay(2000);
     // Log specific startup error. Limited functionality.
 }
@@ -765,7 +719,7 @@ FSM_State_t transition_fault_startup_error() {
 
     // Retry startup after a longer delay, or go to critical
     if (currentTime - startup_attempt_timestamp > 5000) { // Retry every 30 seconds
-        BMS_DEBUG_PRINTLN("Attempting to re-enter STARTUP from FAULT_STARTUP_ERROR.");
+        Serial.println("Attempting to re-enter STARTUP from FAULT_STARTUP_ERROR.");
         // Clear relevant fault flags to allow startup to proceed
         g_faultState.comm_fault_retries = 0; 
         g_faultState.comm_fault_confirmed = false; g_faultState.comm_fault_first_detected_ts = 0;
@@ -778,7 +732,7 @@ FSM_State_t transition_fault_startup_error() {
 }
 
 void action_fault_critical() {
-    BMS_DEBUG_PRINTLN("Action: FAULT_CRITICAL - System Halted. Manual intervention required.");
+    Serial.println("Action: FAULT_CRITICAL - System Halted. Manual intervention required.");
     printBQDump(); 
     static bool dump_done = false;
     if(!dump_done) {
@@ -793,15 +747,15 @@ FSM_State_t transition_fault_critical() {
 }
 
 void action_shutdown_procedure() {
-    BMS_DEBUG_PRINTLN("Action: SHUTDOWN_PROCEDURE");
+    Serial.println("Action: SHUTDOWN_PROCEDURE");
     // 1. Command contactors to open (not implemented here, assumes external)
     // 2. Save critical data (not implemented)
     // 3. Command BQ devices to SHUTDOWN
     BMSErrorCode_t status = bqShutdownDevices();
     if (status == BMS_OK) {
-        BMS_DEBUG_PRINTLN("Shutdown command sent successfully to BQ devices.");
+        Serial.println("Shutdown command sent successfully to BQ devices.");
     } else {
-        BMS_DEBUG_PRINTLN("Error sending shutdown command to BQ devices.");
+        Serial.println("Error sending shutdown command to BQ devices.");
     }
 }
 
@@ -817,13 +771,14 @@ FSM_State_t transition_shutdown_procedure() {
 }
 
 void action_system_off() {
-    BMS_DEBUG_PRINTLN("Action: SYSTEM_OFF. MCU can enter low power or wait for reset.");
+    Serial.println("Action: SYSTEM_OFF. MCU can enter low power or wait for reset.");
     digitalWrite(AMS_FAULT_PIN, LOW); // Clear fault pin if system is intentionally off
     // Optional: Enter MCU deep sleep mode
     while(true) {
-        bqDelayMs(5000); // Stay here, do nothing actively
+        delayMicroseconds(5000); // Stay here, do nothing actively
     }
 }
+
 FSM_State_t transition_system_off(){
     return FSM_STATE_SYSTEM_OFF;
 }

@@ -25,6 +25,7 @@ void read_and_print_bq_control_register(const char* stage_msg, uint8_t dev_id, u
 void action_initial();
 FSM_State_t transition_initial();
 void action_startup();
+void configure_stack(uint8_t &reg_val_8bit, BMSErrorCode_t &status, bool &retFlag);
 FSM_State_t transition_startup();
 void action_normal_operation();
 FSM_State_t transition_normal_operation();

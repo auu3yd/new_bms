@@ -391,6 +391,28 @@ void printBQDump() {
         if (status == BMS_OK) BMS_DEBUG_PRINTF("  FAULT_SYS:   0x%02X\n", read_val_buf[0]); else BMS_DEBUG_PRINTLN("  FAULT_SYS:   READ FAILED");
         status = bqReadReg(deviceAddress, FAULT_COMM1, read_val_buf, 1, FRMWRT_SGL_R);
         if (status == BMS_OK) BMS_DEBUG_PRINTF("  FAULT_COMM1: 0x%02X\n", read_val_buf[0]); else BMS_DEBUG_PRINTLN("  FAULT_COMM1: READ FAILED");
+
+        status = bqReadReg(deviceAddress, FAULT_COMM2, read_val_buf, 1, FRMWRT_SGL_R);
+        if (status == BMS_OK) BMS_DEBUG_PRINTF("  FAULT_COMM2: 0x%02X\n", read_val_buf[0]); else BMS_DEBUG_PRINTLN("  FAULT_COMM2: READ FAILED");
+
+        status = bqReadReg(deviceAddress, FAULT_OV1, read_val_buf, 1, FRMWRT_SGL_R);
+        if (status == BMS_OK) BMS_DEBUG_PRINTF("  FAULT_OV1:   0x%02X\n", read_val_buf[0]); else BMS_DEBUG_PRINTLN("  FAULT_OV1:   READ FAILED");
+
+        status = bqReadReg(deviceAddress, FAULT_OV2, read_val_buf, 1, FRMWRT_SGL_R);
+        if (status == BMS_OK) BMS_DEBUG_PRINTF("  FAULT_OV2:   0x%02X\n", read_val_buf[0]); else BMS_DEBUG_PRINTLN("  FAULT_OV2:   READ FAILED");
+
+        status = bqReadReg(deviceAddress, FAULT_UV1, read_val_buf, 1, FRMWRT_SGL_R);
+        if (status == BMS_OK) BMS_DEBUG_PRINTF("  FAULT_UV1:   0x%02X\n", read_val_buf[0]); else BMS_DEBUG_PRINTLN("  FAULT_UV1:   READ FAILED");
+
+        status = bqReadReg(deviceAddress, FAULT_UV2, read_val_buf, 1, FRMWRT_SGL_R);
+        if (status == BMS_OK) BMS_DEBUG_PRINTF("  FAULT_UV2:   0x%02X\n", read_val_buf[0]); else BMS_DEBUG_PRINTLN("  FAULT_UV2:   READ FAILED");
+
+        status = bqReadReg(deviceAddress, FAULT_OT, read_val_buf, 1, FRMWRT_SGL_R);
+        if (status == BMS_OK) BMS_DEBUG_PRINTF("  FAULT_OT:    0x%02X\n", read_val_buf[0]); else BMS_DEBUG_PRINTLN("  FAULT_OT:    READ FAILED");
+
+        status = bqReadReg(deviceAddress, FAULT_UT, read_val_buf, 1, FRMWRT_SGL_R);
+        if (status == BMS_OK) BMS_DEBUG_PRINTF("  FAULT_UT:    0x%02X\n", read_val_buf[0]); else BMS_DEBUG_PRINTLN("  FAULT_UT:    READ FAILED");
+
         // Add more registers here...
     }
     BMS_DEBUG_PRINTLN("--- End of BQ Register Dump ---");
