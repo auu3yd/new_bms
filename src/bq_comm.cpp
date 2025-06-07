@@ -177,6 +177,8 @@ BMSErrorCode_t bqBroadcastWrite(uint16_t regAddr, uint64_t data, uint8_t numByte
     return bqWriteReg(0, regAddr, data, numBytes, FRMWRT_ALL_W); 
 }
 
+BMSErrorCode_t bqBroadcastRead(uint16_t regAddr, uint8_t *readBuffer, uint8_t numBytesToRead, uint32_t timeout_ms = SERIAL_TIMEOUT_MS * TOTAL_BQ_DEVICES);
+
 BMSErrorCode_t bqStackWrite(uint16_t regAddr, uint64_t data, uint8_t numBytes) {
     return bqWriteReg(0, regAddr, data, numBytes, FRMWRT_STK_W); 
 }
@@ -242,9 +244,10 @@ BMSErrorCode_t bqWakeUpStack() {
     Serial.println("Commanding bridge to wake up BQ79616 stack...");
     // Command BQ79600 to set its shadowed CONTROL1[SEND_WAKE]=1.
     // The BQ79616's CONTROL1 is at 0x309.
-    BMSErrorCode_t status = bqWriteReg(BQ79600_BRIDGE_DEVICE_ID, CONTROL1, (1ULL << 5), 1, FRMWRT_SGL_W);
+    //BMSErrorCode_t status = bqWriteReg(BQ79600_BRIDGE_DEVICE_ID, CONTROL1, (1ULL << 5), 1, FRMWRT_SGL_W);
     // in the original code, this looks like WriteReg(0, CONTROL1, 0x20, 1, FRMWRT_ALL_W);
-    // If that doesn't work, replace it with that and see what happens. Make sure the bqWritereg is compatible with the old one. 
+    // If that doesn't work, [it did in fact not] replace it with that and see what happens. Make sure the bqWritereg is compatible with the old one. 
+    BMSErrorCode_t status = bqBroadcastWrite(CONTROL1, (1ULL << 5), 1);
     if (status != BMS_OK) {
         Serial.println("Failed to send WAKE_STACK command to bridge.");
         return status;
@@ -281,9 +284,11 @@ BMSErrorCode_t bqAutoAddressStack() {
         status = bqBroadcastWrite(DIR0_ADDR, i, 1); 
         if (status != BMS_OK) { BMS_DEBUG_PRINTF("Setting address %d failed\n", i); return status; }
     }
+    
+
 
     Serial.println("  Configure BQ79616s as stack devices...");
-    status = bqStackWrite(COMM_CTRL, 0x02, 1); // STACK_DEV=1, TOP_STACK=0 for all BQ79616s
+    status = bqBroadcastWrite(COMM_CTRL, 0x02, 1); // STACK_DEV=1, TOP_STACK=0 for all BQ79616s
     if (status != BMS_OK) { Serial.println("Configure stack devices failed"); return status; }
 
     if (NUM_BQ79616_DEVICES > 0) {
@@ -295,6 +300,12 @@ BMSErrorCode_t bqAutoAddressStack() {
     // Set BQ79600 (Bridge, device ID 0) as base device
     status = bqWriteReg(BQ79600_BRIDGE_DEVICE_ID, COMM_CTRL, 0x00, 1, FRMWRT_SGL_W); // STACK_DEV=0, TOP_STACK=0
     if (status != BMS_OK) { Serial.println("Configure bridge as base device failed"); return status; }
+
+    // attempting to do that special case
+    if (NUM_BQ79616_DEVICES == 1) {
+    status = bqWriteReg(1, COMM_CTRL, 0x01, 1, FRMWRT_SGL_W);
+    if (status != BMS_OK) return status;
+    }
 
     Serial.println("  DLL Sync (dummy reads)...");
     uint8_t dummyReadBuf[MAX_READ_DATA_BYTES]; 

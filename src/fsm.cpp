@@ -213,16 +213,19 @@ void action_startup() {
 
     // TODO: Does BQWakeUpStack() not already do this? -- in which case, why isn't it being used?
 
-    // Serial.println("[2] Commanding bridge to wake up BQ79616 stack...");
-    // status = bqWakeUpStack();
-    // if (status != BMS_OK) { g_bmsData.communicationFault = true; Serial.println("Startup Error: Stack wakeup failed."); return; }
-    // delayMicroseconds(10); 
-    // Serial.println("[3] Auto Addressing...");
-    // status = bqAutoAddressStack();
-    // if (status != BMS_OK) { g_bmsData.communicationFault = true; Serial.println("Startup Error: Stack autoaddress failed."); return; }
-    // delayMicroseconds(10); 
-    // We need to read BQ79600.CONTROL1, set SEND_WAKE, and write it back.
-    // ADDR_WR on BQ79600 should also be set here for it to take address 0.
+    Serial.println("[2] Commanding bridge to wake up BQ79616 stack...");
+    status = bqWakeUpStack();
+    if (status != BMS_OK) { g_bmsData.communicationFault = true; Serial.println("Startup Error: Stack wakeup failed."); return; }
+    delayMicroseconds(10); 
+    Serial.println("[3] Auto Addressing...");
+    status = bqAutoAddressStack();
+    if (status != BMS_OK) { g_bmsData.communicationFault = true; Serial.println("Startup Error: Stack autoaddress failed."); return; }
+    delayMicroseconds(10); 
+
+
+    //
+    //We need to read BQ79600.CONTROL1, set SEND_WAKE, and write it back.
+    //ADDR_WR on BQ79600 should also be set here for it to take address 0.
     uint8_t bq79600_ctrl1_val;
     status = bqReadReg(BQ79600_BRIDGE_DEVICE_ID, BQ79600_CONTROL1, &bq79600_ctrl1_val, 1, FRMWRT_SGL_R);
     if (status != BMS_OK) { g_bmsData.communicationFault = true; Serial.println("Startup Error (Daisy S2): Failed to read BQ79600.CONTROL1 for SEND_WAKE."); return; }
@@ -235,123 +238,6 @@ void action_startup() {
     read_and_print_bq_control_register("After Daisy S2", BQ79600_BRIDGE_DEVICE_ID, BQ79600_CONTROL1, "BQ79600.CONTROL1");
     delayMicroseconds(10 + STACK_WAKE_PROPAGATION_DELAY_US / 1000); 
 
-    // 3. Auto-Address (Daisy Chain / Northbound using DIR0_ADDR):
-    Serial.println("Daisy Step 3: Auto-Addressing Stack (Northbound)...");
-    
-    // 3a. Dummy broadcast writes to OTP_ECC_DATAIN1-8 (0x036B to 0x0372) for DLL sync.
-    //     Using the corrected defines from user: OTP_ECC_DATAIN1 (0x343) to OTP_ECC_DATAIN8 (0x34A)
-    Serial.println("  DLL Sync (dummy broadcast writes to OTP_ECC_DATAIN1-8)...");
-    const uint16_t dummy_dll_regs[] = {
-        OTP_ECC_DATAIN1, OTP_ECC_DATAIN2, OTP_ECC_DATAIN3, OTP_ECC_DATAIN4,
-        OTP_ECC_DATAIN5, OTP_ECC_DATAIN6, OTP_ECC_DATAIN7, OTP_ECC_DATAIN8
-    };
-    for (int k_reg = 0; k_reg < 8; ++k_reg) {
-        status = bqBroadcastWrite(dummy_dll_regs[k_reg], 0x00, 1);
-        if (status != BMS_OK) { BMS_DEBUG_PRINTF("Startup Warning (Daisy S3a): Dummy broadcast write to 0x%04X failed.\n", dummy_dll_regs[k_reg]); }
-    }
-
-    // 3b. Broadcast write to BQ79616.CONTROL1 (0x0309) to set ADDR_WR=1.
-    Serial.println("  Enable ADDR_WR on stack devices (CONTROL1=0x01)...");
-    // Data 0x01 sets Bit 0 (ADDR_WR)=1 in BQ79616.CONTROL1. DIR_SEL (Bit 7) should be 0 for North.
-    status = bqBroadcastWrite(CONTROL1, 0x01, 1); 
-    if (status != BMS_OK) { g_bmsData.communicationFault = true; Serial.println("Startup Error (Daisy S3b): Broadcast Write for stack ADDR_WR failed."); return; }
-    delayMicroseconds(5);
-
-    // 3c. Broadcast write sequential addresses to DIR0_ADDR (0x0306).
-    //     (Address 0 for bridge, 1 for first BQ79616, etc.)
-    //     BQ79600's CONTROL1[ADDR_WR] was set in Step 2.
-    /*  ----- 3c : write sequential addresses --------------------- */
-for (uint8_t i = 0; i < NUM_BQ79616_DEVICES; ++i) {
-    bqBroadcastWrite(DIR0_ADDR, i + 1, 1);   // addr 1, 2, …
-}
-
-/*  NEW — Step 4: exit address-write mode  */
-bqBroadcastWrite(CONTROL1, 0x00, 1);         // ADDR_WR = 0
-delayMicroseconds(150);                      // ≥100 µs guard time
-/*  ----------------------------------------------------------- */
-
-/*  ----- 3d : put devices into stack mode -------------------- */
-bqBroadcastWrite(COMM_CTRL, 0x02, 1);         // STACK_DEV = 1
-
-    // 3d. Set COMM_CTRL (0x0308) for bridge, stack devices, and ToS.
-    Serial.println("  Configure BQ79616s as stack devices (COMM_CTRL=0x02)...");
-    status = bqBroadcastWrite(COMM_CTRL, 0x02, 1); // STACK_DEV=1, TOP_STACK=0 for BQ79616s
-    delayMicroseconds(100);
-    if (status != BMS_OK) { g_bmsData.communicationFault = true; Serial.println("Startup Error (Daisy S3d): Broadcast write for BQ79616 COMM_CTRL failed."); return; }
-
-    if (NUM_BQ79616_DEVICES > 0) {
-        uint8_t tos_address = NUM_BQ79616_DEVICES; 
-        BMS_DEBUG_PRINTF("  Configure ToS device (Addr %d) COMM_CTRL=0x03...\n", tos_address);
-        status = bqWriteReg(tos_address, COMM_CTRL, 0x03, 1, FRMWRT_SGL_W); 
-        delayMicroseconds(100);
-        if (status != BMS_OK) { BMS_DEBUG_PRINTF("Startup Error (Daisy S3d): Configure ToS device (Addr %d) failed.\n", tos_address); g_bmsData.communicationFault = true; return; }
-    }
-    Serial.println("  Configure BQ79600 (Addr 0) as base (COMM_CTRL=0x00)...");
-    status = bqWriteReg(BQ79600_BRIDGE_DEVICE_ID, COMM_CTRL, 0x00, 1, FRMWRT_SGL_W); 
-    delayMicroseconds(100);
-    if (status != BMS_OK) { Serial.println("Startup Error (Daisy S3d): Configure bridge as base device failed."); g_bmsData.communicationFault = true; return; }
-
-    // 3e. Dummy stack reads from OTP_ECC_DATAIN1-8.
-    Serial.println("  DLL Sync (dummy stack reads OTP_ECC_DATAIN1-8)...");
-    for (int k_reg = 0; k_reg < 8; ++k_reg) {
-        status = bqStackRead(dummy_dll_regs[k_reg], dummy_read_buffer, 1); 
-        if (status != BMS_OK && status != BMS_ERROR_CRC && status != BMS_ERROR_COMM_TIMEOUT) { 
-             BMS_DEBUG_PRINTF("Startup Warning (Daisy S3e): Dummy stack read from 0x%04X failed.\n", dummy_dll_regs[k_reg]);
-        }
-    }
-
-    // 3f. Verify Auto-Addressing by reading DIR0_ADDR from stack devices
-    Serial.println("  Verifying stack device addresses (DIR0_ADDR)...");
-    bool addressing_ok = true;
-    /* buffer order after broadcast read is ToS → ... → bridge */
-    uint8_t addr_read_buffer[NUM_BQ79616_DEVICES + 1];
-    if (NUM_BQ79616_DEVICES > 0) {
-        status = bqBroadcastRead(DIR0_ADDR,
-                                 addr_read_buffer,
-                                 1,
-                                 SERIAL_TIMEOUT_MS * (NUM_BQ79616_DEVICES + 1));
-        if (status != BMS_OK) {
-            Serial.println("Startup Error (Daisy S3f): Broadcast read for DIR0_ADDR verification failed.");
-            addressing_ok = false;
-            g_bmsData.communicationFault = true;
-        } else {
-                      /* frame[0] = ToS (addr = NUM_BQ79616_DEVICES), so flip index */
-            for (uint8_t idx = 0; idx < NUM_BQ79616_DEVICES; ++idx) {
-                uint8_t frame      = addr_read_buffer[idx];
-                uint8_t exp_addr   = NUM_BQ79616_DEVICES - idx;  /* ToS, …, 1 */
-                if (frame != exp_addr) {
-                   BMS_DEBUG_PRINTF("ERROR (S3f): device exp %d got 0x%02X\n",
-                                      exp_addr, frame);
-                   addressing_ok = false;
-               } else 
-               {                    BMS_DEBUG_PRINTF("S3f OK: device addr %d present\n", frame);
-               }
-            }
-    }
-}
-    // Verify BQ79600 address
-    uint8_t bridge_dir0_addr;
-    status = bqReadReg(BQ79600_BRIDGE_DEVICE_ID, DIR0_ADDR, &bridge_dir0_addr, 1, FRMWRT_SGL_R);
-    if (status == BMS_OK) {
-        if (bridge_dir0_addr == BQ79600_BRIDGE_DEVICE_ID) {
-            BMS_DEBUG_PRINTF("Daisy S3f: Bridge Addr %d DIR0_ADDR OK: 0x%02X\n", BQ79600_BRIDGE_DEVICE_ID, bridge_dir0_addr);
-        } else {
-            BMS_DEBUG_PRINTF("ERROR (Daisy S3f): Bridge Addr %d reported DIR0_ADDR 0x%02X\n", BQ79600_BRIDGE_DEVICE_ID, bridge_dir0_addr);
-            addressing_ok = false; g_bmsData.communicationFault = true;
-        }
-    } else {
-        Serial.println("Startup Error (Daisy S3f): Failed to read Bridge DIR0_ADDR.");
-        addressing_ok = false; g_bmsData.communicationFault = true;
-    }
-    if (!addressing_ok) return;
-
-
-    // 3g. Broadcast write to FAULT_RST1 & FAULT_RST2 to clear communication faults.
-    // (This is done by resetAllBQFaults later, but example did it here too)
-    Serial.println("  Resetting stack comm faults (FAULT_RST1/2)...");
-    //Serial.println("Daisy Step 3: Auto-Addressing Complete.");
-    //if (g_bmsData.communicationFault) return;
-    
 
     // -----------------------------------------------------------------------------------------------------------
     // all the stuff above this, I think there is already a function for. I need to compare the two but will do it later
