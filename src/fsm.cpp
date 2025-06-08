@@ -217,26 +217,29 @@ void action_startup() {
     status = bqWakeUpStack();
     if (status != BMS_OK) { g_bmsData.communicationFault = true; Serial.println("Startup Error: Stack wakeup failed."); return; }
     delayMicroseconds(10); 
-    Serial.println("[3] Auto Addressing...");
-    status = bqAutoAddressStack();
-    if (status != BMS_OK) { g_bmsData.communicationFault = true; Serial.println("Startup Error: Stack autoaddress failed."); return; }
-    delayMicroseconds(10); 
 
+    Serial.println("[2] Commanding bridge to wake up BQ79616 stack...");
 
-    //
-    //We need to read BQ79600.CONTROL1, set SEND_WAKE, and write it back.
-    //ADDR_WR on BQ79600 should also be set here for it to take address 0.
-    uint8_t bq79600_ctrl1_val;
-    status = bqReadReg(BQ79600_BRIDGE_DEVICE_ID, BQ79600_CONTROL1, &bq79600_ctrl1_val, 1, FRMWRT_SGL_R);
-    if (status != BMS_OK) { g_bmsData.communicationFault = true; Serial.println("Startup Error (Daisy S2): Failed to read BQ79600.CONTROL1 for SEND_WAKE."); return; }
+/*  a) broadcast 0x20  -> SEND_WAKE = 1 (bit-5)                       */
+status = bqBroadcastWrite(CONTROL1, 0x20, 1);      // legacy step
+if (status != BMS_OK) { g_bmsData.communicationFault = true;
+    Serial.println("Startup Error: SEND_WAKE broadcast failed."); return; }
+delayMicroseconds(10);                             // let wake-tone start
 
-    bq79600_ctrl1_val |= BQ79600_CTRL1_SEND_WAKE_BIT; // Set SEND_WAKE
-    bq79600_ctrl1_val |= BQ79600_CTRL1_ADDR_WR_BIT;  // Enable ADDR_WR for BQ79600
+/*  b) broadcast 0x01  -> ADDR_WR = 1 (bit-0), SEND_WAKE clears       */
+status = bqBroadcastWrite(CONTROL1, 0x01, 1);      // legacy step
+if (status != BMS_OK) { g_bmsData.communicationFault = true;
+    Serial.println("Startup Error: ADDR_WR broadcast failed."); return; }
+delayMicroseconds(10);                             // settle before DIR0 loop
 
-    status = bqWriteReg(BQ79600_BRIDGE_DEVICE_ID, BQ79600_CONTROL1, bq79600_ctrl1_val, 1, FRMWRT_SGL_W);
-    if (status != BMS_OK) { g_bmsData.communicationFault = true; Serial.println("Startup Error (Daisy S2): Stack wakeup command (SEND_WAKE/ADDR_WR) failed."); return; }
-    read_and_print_bq_control_register("After Daisy S2", BQ79600_BRIDGE_DEVICE_ID, BQ79600_CONTROL1, "BQ79600.CONTROL1");
-    delayMicroseconds(10 + STACK_WAKE_PROPAGATION_DELAY_US / 1000); 
+/* ------------------------------------------------------------------ */
+/* [3] Auto Addressing                                                */
+/* ------------------------------------------------------------------ */
+Serial.println("[3] Auto Addressing...");
+status = bqAutoAddressStack();
+if (status != BMS_OK) { g_bmsData.communicationFault = true;
+    Serial.println("Startup Error: Stack autoaddress failed."); return; }
+delayMicroseconds(10);
 
 
     // -----------------------------------------------------------------------------------------------------------
