@@ -4,13 +4,13 @@
 #include "config.h" // For NUM_BQ79616_DEVICES
 
 // Frame Write Types for BQ796xx series
-#define FRMWRT_SGL_R 0x00 
-#define FRMWRT_SGL_W 0x10 
-#define FRMWRT_STK_R 0x20 
-#define FRMWRT_STK_W 0x30 
-#define FRMWRT_ALL_R 0x40 
-#define FRMWRT_ALL_W 0x50 
-#define FRMWRT_REV_ALL_W 0xE0 
+#define FRMWRT_SGL_R 0x00 // single device read
+#define FRMWRT_SGL_W 0x10 // single device write
+#define FRMWRT_STK_R 0x20 // stack read
+#define FRMWRT_STK_W 0x30 // stack write
+#define FRMWRT_ALL_R 0x40 // broadcast read
+#define FRMWRT_ALL_W 0x50 // broadcast write
+#define FRMWRT_REV_ALL_W 0xE0 // broadcast write with reverse order
 
 // BQ79600 Bridge Device ID
 #define BQ79600_BRIDGE_DEVICE_ID 0x00

@@ -13,6 +13,7 @@ BMSErrorCode_t bqGetStackFaultStatus(BMSOverallData_t *bmsData);
 BMSErrorCode_t bqGetBridgeFaultStatus(BMSOverallData_t *bmsData); 
 
 // Data processing
+void printCellData(const BMSOverallData_t *bmsData);
 void processRawVoltages(BMSOverallData_t *bmsData);
 void processRawTemperatures(BMSOverallData_t *bmsData);
 void updatePackStatistics(BMSOverallData_t *bmsData); 

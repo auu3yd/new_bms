@@ -181,8 +181,8 @@ BMSErrorCode_t resetAllBQFaults() {
     BMSErrorCode_t status_stack1, status_stack2, status_bridge;
     
     status_stack1 = bqBroadcastWrite(FAULT_RST1, 0xFF, 1); 
-    status_stack2 = bqBroadcastWrite(FAULT_RST2, 0xFF, 1); 
-    status_bridge = bqWriteReg(BQ79600_BRIDGE_DEVICE_ID, BQ79600_FAULT_RST, BQ79600_FLTRST_RST_ALL_FLGS_BIT, 1, FRMWRT_SGL_W); // Use RST_ALL_FLGS bit
+    status_stack2 = bqBroadcastWrite(FAULT_RST2, 0xFF, 1);  // reset stack device faults
+    status_bridge = bqWriteReg(BQ79600_BRIDGE_DEVICE_ID, 0x2030, 0xFF, 1, FRMWRT_SGL_W);  // Use RST_ALL_FLGS bit
     
     if(status_stack1 != BMS_OK) BMS_DEBUG_PRINTLN("Failed to reset FAULT_RST1");
     if(status_stack2 != BMS_OK) BMS_DEBUG_PRINTLN("Failed to reset FAULT_RST2");

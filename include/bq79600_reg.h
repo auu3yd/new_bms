@@ -18,11 +18,11 @@
 #define BQ79600_DEV_CONF1       0x2001  
 #define BQ79600_DEV_CONF2       0x2002  
 
-#define BQ79600_FAULT_SUMMARY_REG 0x2103
+#define BQ79600_FAULT_SUMMARY_REG 0x2100
 #define BQ79600_FAULT_COMM1     0x2104  
 #define BQ79600_FAULT_COMM2     0x2105 
-#define BQ79600_FAULT_SYS       0x2106 // System Fault Register
-#define BQ79600_FAULT_PWR       0x2107 // Power Fault Register
+#define BQ79600_FAULT_SYS       0x2102 // System Fault Register
+#define BQ79600_FAULT_PWR       0x2103 // Power Fault Register
 
 #define BQ79600_FAULT_RST       0x2030  
 
