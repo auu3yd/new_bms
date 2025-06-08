@@ -24,7 +24,7 @@ BMSErrorCode_t bqStackRead(uint16_t regAddr, uint8_t *readBuffer, uint8_t numByt
 BMSErrorCode_t bqBroadcastWriteReverse(uint16_t regAddr, uint64_t data, uint8_t numBytes);
 
 void bqInitCommunication();
-BMSErrorCode_t bqWakeUpBridge();
+BMSErrorCode_t bqWakePing();
 BMSErrorCode_t bqWakeUpStack();
 BMSErrorCode_t bqAutoAddressStack();
 

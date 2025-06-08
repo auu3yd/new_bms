@@ -26,19 +26,27 @@ BMSErrorCode_t bqGetAllCellVoltages(BMSOverallData_t *bmsData) {
     // BMS_DEBUG_PRINTLN("Reading all cell voltages...");
     uint8_t rawVoltageData[MAX_STACK_RESPONSE_BUFFER_SIZE]; 
     
-    uint16_t start_addr = VCELL1_LO; 
+    uint16_t start_addr = VCELL16_HI; 
     
     BMSErrorCode_t status = bqStackRead(start_addr, rawVoltageData, CELLS_PER_SLAVE * 2, SERIAL_TIMEOUT_MS * NUM_BQ79616_DEVICES * 2);
+    // // Print rawVoltageData as hex bytes for debugging
+    // for (size_t idx = 0; idx < CELLS_PER_SLAVE * 2 * NUM_BQ79616_DEVICES; ++idx) {
+    //     Serial.print(rawVoltageData[idx], HEX);
+    //     Serial.print(" ");
+    // }
+    // Serial.println();
+
     if (status != BMS_OK) {
         BMS_DEBUG_PRINTLN("Failed to read cell voltages from stack.");
+
         return status;
     }
 
     for (int i = 0; i < NUM_BQ79616_DEVICES; ++i) {
         for (int j = 0; j < CELLS_PER_SLAVE; ++j) {
             int raw_idx = (i * CELLS_PER_SLAVE * 2) + (j * 2);
-            uint8_t lsb = rawVoltageData[raw_idx];
-            uint8_t msb = rawVoltageData[raw_idx + 1];
+            uint8_t msb = rawVoltageData[raw_idx];
+            uint8_t lsb = rawVoltageData[raw_idx + 1];
             // BQ79616 voltage data is 16-bit signed, MSB first in memory map (e.g. VCELLx_HI then VCELLx_LO)
             // Stack read concatenates these. If VCELL1_LO is start, then data is CELL1_LO, CELL1_HI, CELL2_LO, CELL2_HI...
             // So lsb is at raw_idx, msb is at raw_idx + 1.
@@ -56,7 +64,7 @@ BMSErrorCode_t bqGetAllTemperatures(BMSOverallData_t *bmsData) {
     // BMS_DEBUG_PRINTLN("Reading all temperatures...");
     uint8_t rawTempData[MAX_STACK_RESPONSE_BUFFER_SIZE]; 
     
-    BMSErrorCode_t status = bqStackRead(GPIO1_LO, rawTempData, TEMP_SENSORS_PER_SLAVE * 2, SERIAL_TIMEOUT_MS * NUM_BQ79616_DEVICES);
+    BMSErrorCode_t status = bqStackRead(GPIO1_HI, rawTempData, TEMP_SENSORS_PER_SLAVE * 2, SERIAL_TIMEOUT_MS * NUM_BQ79616_DEVICES);
     if (status != BMS_OK) {
         BMS_DEBUG_PRINTLN("Failed to read GPIO temperatures from stack.");
         return status;
@@ -65,8 +73,8 @@ BMSErrorCode_t bqGetAllTemperatures(BMSOverallData_t *bmsData) {
     for (int i = 0; i < NUM_BQ79616_DEVICES; ++i) {
         for (int j = 0; j < TEMP_SENSORS_PER_SLAVE; ++j) {
             int raw_idx = (i * TEMP_SENSORS_PER_SLAVE * 2) + (j * 2);
-            uint8_t lsb = rawTempData[raw_idx];
-            uint8_t msb = rawTempData[raw_idx + 1];
+            uint8_t msb = rawTempData[raw_idx];
+            uint8_t lsb = rawTempData[raw_idx + 1];
             int16_t raw_gpio_voltage_adc = (int16_t)((msb << 8) | lsb);
             
             float gpio_voltage_uv = (float)raw_gpio_voltage_adc * 152.59f; 
@@ -91,8 +99,8 @@ BMSErrorCode_t bqGetAllTemperatures(BMSOverallData_t *bmsData) {
     }
     for (int i = 0; i < NUM_BQ79616_DEVICES; ++i) {
         int raw_idx = i * 2; 
-        uint8_t lsb = rawTempData[raw_idx];
-        uint8_t msb = rawTempData[raw_idx + 1];
+        uint8_t msb = rawTempData[raw_idx];
+        uint8_t lsb = rawTempData[raw_idx + 1];
         int16_t raw_dietemp = (int16_t)((msb << 8) | lsb);
         bmsData->modules[i].dieTemperature = (int16_t)((float)raw_dietemp * 0.025f * 10.0f);
     }
@@ -416,4 +424,56 @@ void printBQDump() {
         // Add more registers here...
     }
     BMS_DEBUG_PRINTLN("--- End of BQ Register Dump ---");
+}
+
+void printCellData(const BMSOverallData_t *d)
+{
+
+    // 2) Pack metrics
+    Serial.println("\n--- Pack Metrics ---");
+    Serial.printf("Total Pack Voltage : %u mV\n", d->totalPackVoltage_mV);
+    Serial.printf("Cell Voltage   : min %u mV, max %u mV\n",
+                  d->minCellVoltage_mV, d->maxCellVoltage_mV);
+    Serial.printf("Cell Temp (°C): min %.1f, max %.1f\n",
+                  d->minCellTemp_C10/10.0f, d->maxCellTemp_C10/10.0f);
+    Serial.printf("State of Charge  : %u %%\n", d->stateOfCharge_pct);
+
+    // 3) Fault flags
+    Serial.println("\n--- Fault Flags ---");
+    Serial.printf("Comm Fault        : %s\n", d->communicationFault      ? "YES":"no");
+    Serial.printf("Over Voltage      : %s\n", d->overVoltageFault       ? "YES":"no");
+    Serial.printf("Under Voltage     : %s\n", d->underVoltageFault      ? "YES":"no");
+    Serial.printf("Over Temperature : %s\n", d->overTemperatureFault   ? "YES":"no");
+    Serial.printf("Under Temperature: %s\n", d->underTemperatureFault  ? "YES":"no");
+    Serial.printf("Overall Fault    : %s\n", d->overallFaultStatus     ? "YES":"no");
+
+    // 4) Balancing & interlocks
+    Serial.println("\n--- Balancing & Interlocks ---");
+    for (uint8_t m=0; m<NUM_BQ79616_DEVICES; ++m) {
+        Serial.printf("Module %u active balance cell: %u\n",
+                      m, d->activeBalancingCells[m]);
+    }
+    Serial.printf("Balancing requested  : %s\n", d->balancing_request      ? "YES":"no");
+    Serial.printf("Balancing active     : %s\n", d->balancing_cycle_active? "YES":"no");
+    Serial.printf("Reset pin active     : %s\n", d->reset_pin_active      ? "YES":"no");
+    Serial.printf("IMD status OK        : %s\n", d->imd_status_ok         ? "YES":"no");
+    Serial.printf("Positive air closed  : %s\n", d->pos_air_closed        ? "YES":"no");
+    Serial.printf("Negative air closed  : %s\n", d->neg_air_closed        ? "YES":"no");
+
+    // 5) Per-module cell voltages & temps
+    for (uint8_t mod = 0; mod < NUM_BQ79616_DEVICES; ++mod)
+    {
+        Serial.printf("\nModule %u\n", mod);
+        // voltages
+        Serial.print("Volt :");
+        for (uint8_t c = 0; c < CELLS_PER_SLAVE; ++c)
+            Serial.printf("%5u", d->modules[mod].cellVoltages[c]);
+        Serial.println("  (mV)");
+        // temps
+        Serial.print("Temp :");
+        for (uint8_t c = 0; c < TEMP_SENSORS_PER_SLAVE; ++c)
+            Serial.printf("%5.0f", d->modules[mod].cellTemperatures[c]/10.0f);
+        Serial.println("  (°C)");
+    }
+    Serial.println();
 }

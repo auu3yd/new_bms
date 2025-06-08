@@ -202,44 +202,34 @@ void action_startup() {
     bqShutdownDevices(); // Ensure all devices are in shutdown state before startup
     delay(100); // Allow devices to settle after shutdown
 
+    // The following steps are based on the BQ79616 Daisy Chain Startup Sequence on page 27 of the datasheet.
+        
     // 1. MCU sends WAKE ping to BQ79600-Q1.
     Serial.println("[1] Waking up BQ79600 bridge...");
-    status = bqWakeUpBridge();
+    status = bqWakePing();
     if (status != BMS_OK) { g_bmsData.communicationFault = true; Serial.println("Startup Error: Bridge wakeup failed."); return; }
     delayMicroseconds(10); 
 
     // 2. Single device write to BQ79600-Q1 CONTROL1 [SEND_WAKE] = 1 (wake up stack devices)
     //    (BQ79600 CONTROL1 is 0x0309, SEND_WAKE is bit 5)
-
     // TODO: Does BQWakeUpStack() not already do this? -- in which case, why isn't it being used?
+    // ansewr to all of above: no, not anymore, thats now aprt of the bqWakePing() function
 
-    Serial.println("[2] Commanding bridge to wake up BQ79616 stack...");
-    status = bqWakeUpStack();
-    if (status != BMS_OK) { g_bmsData.communicationFault = true; Serial.println("Startup Error: Stack wakeup failed."); return; }
-    delayMicroseconds(10); 
+    Serial.println("[2] Commanding bridge to wake up BQ79616 stack..."); //I am leaving this here because I don't want to renumber the steps
 
-    Serial.println("[2] Commanding bridge to wake up BQ79616 stack...");
+    // this does nothing (can remove in a code clean eventually)
+    //status = bqWakeUpStack();
+    //if (status != BMS_OK) { g_bmsData.communicationFault = true; Serial.println("Startup Error: Stack wakeup failed."); return; }
+    //delayMicroseconds(10); 
 
-/*  a) broadcast 0x20  -> SEND_WAKE = 1 (bit-5)                       */
-status = bqBroadcastWrite(CONTROL1, 0x20, 1);      // legacy step
-if (status != BMS_OK) { g_bmsData.communicationFault = true;
-    Serial.println("Startup Error: SEND_WAKE broadcast failed."); return; }
-delayMicroseconds(10);                             // let wake-tone start
-
-/*  b) broadcast 0x01  -> ADDR_WR = 1 (bit-0), SEND_WAKE clears       */
-status = bqBroadcastWrite(CONTROL1, 0x01, 1);      // legacy step
-if (status != BMS_OK) { g_bmsData.communicationFault = true;
-    Serial.println("Startup Error: ADDR_WR broadcast failed."); return; }
-delayMicroseconds(10);                             // settle before DIR0 loop
-
-/* ------------------------------------------------------------------ */
-/* [3] Auto Addressing                                                */
-/* ------------------------------------------------------------------ */
-Serial.println("[3] Auto Addressing...");
-status = bqAutoAddressStack();
-if (status != BMS_OK) { g_bmsData.communicationFault = true;
-    Serial.println("Startup Error: Stack autoaddress failed."); return; }
-delayMicroseconds(10);
+    /* ------------------------------------------------------------------ */
+    /* [3] Auto Addressing                                                */
+    /* ------------------------------------------------------------------ */
+    Serial.println("[3] Auto Addressing...");
+    status = bqAutoAddressStack();
+    if (status != BMS_OK) { g_bmsData.communicationFault = true;
+        Serial.println("[3] Startup Error: Stack autoaddress failed."); return; }
+    delayMicroseconds(10);
 
 
     // -----------------------------------------------------------------------------------------------------------
@@ -260,24 +250,26 @@ delayMicroseconds(10);
     if (retFlag)
         return;
 
+    Serial.println("[4.5] Disabling OV/UV and OT/UT faults on all stack devices...");
+    Serial.println("[WARNING!!!!!] THIS IS DANGEROUS! DO NOT USE THIS IN PRODUCTION!");
+    /* Mask-off UT, OT, and UV faults on every stack device (bits 6‒4 = 1) */
+    status = bqStackWrite(FAULT_MSK1, 0x70, 1);   // 0x40 | 0x20 | 0x10 = 0x70
+    // REMOVE THIS BEFORE EVER ALLOWING THIS TO CONNECT TO ACTUAL CELLS
+    // THIS CAN KILL PEOPLE IF YOU ARE NEGLIGENT 
+
+
     // 5. Final Fault Reset
     Serial.println("[5] Resetting all BQ device faults post-configuration...");
     status = resetAllBQFaults(); 
     if (status != BMS_OK) {
-        Serial.println("Startup Warning (Daisy S5): Failed to reset BQ faults post-configuration.");
+        Serial.println("Startup Warning [5]: Failed to reset BQ faults post-configuration.");
     }
-    
+
     Serial.println("Startup sequence complete. ");
     g_bmsData.balancing_request = false; 
     g_bmsData.balancing_cycle_active = false;
     for(int i=0; i<NUM_BQ79616_DEVICES; ++i) g_bmsData.activeBalancingCells[i] = 0;
-    
-    // Print some final states for BQ79600
-    // read_and_print_bq_control_register("End of Daisy Startup", BQ79600_BRIDGE_DEVICE_ID, BQ79600_CONTROL1, "BQ79600.CONTROL1");
-    // read_and_print_bq_control_register("End of Daisy Startup", BQ79600_BRIDGE_DEVICE_ID, BQ79600_DEV_CONF1, "BQ79600.DEV_CONF1");
-    // For Daisy Chain, BQ79600 CONTROL2 is not critical for mode, but can print for info
 
-    // The function verify_stack_communication_after_startup() in transition_startup will do a final check.
 }
 
 FSM_State_t transition_startup() {
@@ -301,8 +293,8 @@ void action_normal_operation() {
 
     status = bqGetAllTemperatures(&g_bmsData);
     if (status != BMS_OK) current_cycle_comm_ok = false;
-    
-    status = bqGetStackFaultStatus(&g_bmsData); 
+    printCellData(&g_bmsData);
+    //status = bqGetStackFaultStatus(&g_bmsData); 
     if (status != BMS_OK) current_cycle_comm_ok = false;
 
     status = bqGetBridgeFaultStatus(&g_bmsData); 
@@ -539,7 +531,7 @@ void action_fault_communication() {
         Serial.println("Performing full stack re-initialization for recovery...");
         BMSErrorCode_t status_recovery = BMS_OK;
         
-        if(bqWakeUpBridge() != BMS_OK) status_recovery = BMS_ERROR_WAKEUP_FAILED;
+        if(bqWakePing() != BMS_OK) status_recovery = BMS_ERROR_WAKEUP_FAILED;
         if(status_recovery == BMS_OK && bqWakeUpStack() != BMS_OK) status_recovery = BMS_ERROR_WAKEUP_FAILED;
         if(status_recovery == BMS_OK && bqConfigureBridgeForRing() != BMS_OK) status_recovery = BMS_ERROR_CONFIG_FAILED;
         if(status_recovery == BMS_OK && bqAutoAddressStack() != BMS_OK) status_recovery = BMS_ERROR_AUTOADDRESS_FAILED;

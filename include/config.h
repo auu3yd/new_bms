@@ -53,7 +53,7 @@
 
 // Safety Thresholds
 #define MAX_CELL_VOLTAGE_MV 4200
-#define MIN_CELL_VOLTAGE_MV 2000
+#define MIN_CELL_VOLTAGE_MV 1000
 #define MAX_CELL_TEMP_C 60
 #define MIN_CELL_TEMP_C 0
 #define MAX_BQ_DIE_TEMP_C 85

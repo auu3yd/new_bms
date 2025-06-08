@@ -177,7 +177,90 @@ BMSErrorCode_t bqBroadcastWrite(uint16_t regAddr, uint64_t data, uint8_t numByte
     return bqWriteReg(0, regAddr, data, numBytes, FRMWRT_ALL_W); 
 }
 
-BMSErrorCode_t bqBroadcastRead(uint16_t regAddr, uint8_t *readBuffer, uint8_t numBytesToRead, uint32_t timeout_ms = SERIAL_TIMEOUT_MS * TOTAL_BQ_DEVICES);
+BMSErrorCode_t bqBroadcastRead(uint16_t regAddr, uint8_t *readBuffer, uint8_t numBytesToRead, uint32_t timeout_ms /* = SERIAL_TIMEOUT_MS * TOTAL_BQ_DEVICES */)
+{
+    /* ---- argument sanity ---- */
+    if (readBuffer == nullptr ||
+        numBytesToRead == 0 ||
+        numBytesToRead > MAX_READ_DATA_BYTES)
+        return BMS_ERROR_INVALID_RESPONSE;
+#define BMS_DEBUG
+    if (regAddr < 0x0000 || regAddr > 0x3FFF) {
+        Serial.println(F("[BRD_R] Invalid register address"));
+        return BMS_ERROR_INVALID_RESPONSE;
+    }
+#ifdef BMS_DEBUG
+    Serial.print  (F("[BRD_R] reg 0x"));
+    Serial.print  (regAddr, HEX);
+    Serial.print  (F("  len "));
+    Serial.println(numBytesToRead);
+#endif
+
+    /* ---- 1. send the ALL_R command frame ---- */
+    BMSErrorCode_t st = buildAndSendFrame(
+        0, regAddr,
+        nullptr,
+        numBytesToRead,          /* LEN = bytes to read */
+        FRMWRT_ALL_R);           /* broadcast read opcode */
+    if (st != BMS_OK) {
+#ifdef BMS_DEBUG
+        Serial.println(F("[BRD_R] buildAndSendFrame failed"));
+#endif
+        return st;
+    }
+
+    /* ---- 2. receive response frames ---- */
+    constexpr size_t HDR_LEN  = 4;     /* INIT, ADDR, CMD, LEN */
+    constexpr size_t CRC_LEN  = 2;     /* 16-bit CRC           */
+    const     size_t FRAME_LEN  = HDR_LEN + numBytesToRead + CRC_LEN;
+    const     size_t TOTAL_LEN  = FRAME_LEN * TOTAL_BQ_DEVICES;
+
+    uint8_t rxBuf[TOTAL_LEN];
+    st = receiveFrame(rxBuf, TOTAL_LEN, timeout_ms);
+    if (st != BMS_OK) {
+#ifdef BMS_DEBUG
+        Serial.println(F("[BRD_R] receiveFrame timeout / UART error"));
+#endif
+        return st;
+    }
+
+#ifdef BMS_DEBUG
+    Serial.print  (F("[BRD_R] got "));
+    Serial.print  (TOTAL_LEN);
+    Serial.println(F(" bytes"));
+#endif
+
+    /* ---- 3. CRC check + copy data ---- */
+    for (size_t dev = 0; dev < TOTAL_BQ_DEVICES; ++dev) {
+        size_t off = dev * FRAME_LEN;
+
+        uint16_t crc_rx  = (rxBuf[off + FRAME_LEN - 1] << 8) |
+                            rxBuf[off + FRAME_LEN - 2];
+        uint16_t crc_cal = calculateCRC16(&rxBuf[off], FRAME_LEN - CRC_LEN);
+
+#ifdef BMS_DEBUG
+        Serial.print  (F("  frame["));
+        Serial.print  (dev);
+        Serial.print  (F("] INIT 0x"));
+        Serial.print  (rxBuf[off], HEX);
+        Serial.print  (F(" ADDR 0x"));
+        Serial.print  (rxBuf[off+1], HEX);
+        Serial.print  (F(" CRC "));
+        Serial.println(crc_rx == crc_cal ? F("OK") : F("FAIL"));
+#endif
+
+        if (crc_rx != crc_cal) return BMS_ERROR_CRC;
+
+        memcpy(readBuffer + dev * numBytesToRead,
+               &rxBuf[off + HDR_LEN],
+               numBytesToRead);
+    }
+
+#ifdef BMS_DEBUG
+    Serial.println(F("[BRD_R] success"));
+#endif
+    return BMS_OK;
+}
 
 BMSErrorCode_t bqStackWrite(uint16_t regAddr, uint64_t data, uint8_t numBytes) {
     return bqWriteReg(0, regAddr, data, numBytes, FRMWRT_STK_W); 
@@ -222,7 +305,7 @@ BMSErrorCode_t bqBroadcastWriteReverse(uint16_t regAddr, uint64_t data, uint8_t 
 
 // This function is used to wake up the BQ79600 bridge device. It is *only* meant to be called during startup either during initialization or after an error. 
 // you should probably call a shutdown commands before this one; I won't enforce it here now, but maybe later on if it makes sense. 
-BMSErrorCode_t bqWakeUpBridge() {
+BMSErrorCode_t bqWakePing() {
     Serial.println("Waking up BQ79600 bridge...");
     if (BQ_UART_SERIAL) BQ_UART_SERIAL.end(); // If Serial 5 is active, then end it 
     delay(1);
@@ -236,10 +319,21 @@ BMSErrorCode_t bqWakeUpBridge() {
     delay(1); // Allow UART to settle
 
     delayMicroseconds(BQ79600_WAKE_TO_ACTIVE_US); 
+
+    BMSErrorCode_t status = bqWriteReg(BQ79600_BRIDGE_DEVICE_ID, BQ79600_CONTROL1, 0x20, 1, FRMWRT_SGL_W);   // SEND_WAKE (bit 5) = 1
+    if (status != BMS_OK) {
+        Serial.println("Failed to send WAKE_STACK command to bridge.");
+        return status;
+    }
+    bqDelayUs(STACK_WAKE_PROPAGATION_DELAY_US); // this is set in the config and as per the datasheet. Probably shoudn't fuck with. 
     Serial.println("BQ79600 WAKE ping sent.");
+
+
     return BMS_OK; // if this went OK, then we can return BMS_OK (otherwise it will fail and probably time out)
 }
 
+
+// we do not use this anymore, but ill leave it here for posterity
 BMSErrorCode_t bqWakeUpStack() {
     Serial.println("Commanding bridge to wake up BQ79616 stack...");
     // Command BQ79600 to set its shadowed CONTROL1[SEND_WAKE]=1.
@@ -270,7 +364,7 @@ BMSErrorCode_t bqAutoAddressStack() {
         if (status != BMS_OK) { BMS_DEBUG_PRINTF("DLL Sync Write failed for reg 0x%X\n", reg); return status; }
     }
     
-    // and then allow them to auto-addresss...
+    // and then allow them to auto-addresss... (step 4 in datasheet)
     Serial.println("  Enable auto-address mode...");
     status = bqBroadcastWrite(CONTROL1, 0x01, 1); // Set ADDR_WR bit (TODO: Add datasheet reference)
     if (status != BMS_OK) { Serial.println("Enable auto-address mode failed"); return status; }
@@ -279,34 +373,32 @@ BMSErrorCode_t bqAutoAddressStack() {
     // TODO (and this is a big TODO): There is a special case where we only have one segment board. In this case, we need to set its address to both base and TOS. 
     // The old code does this (and seems to work fine) so that implementation should just be carried over. 
 
+    // step 5
     Serial.println("  Setting device addresses...");
     for (uint8_t i = 0; i < TOTAL_BQ_DEVICES; ++i) { // Bridge (0) + segments (1 to N)
         status = bqBroadcastWrite(DIR0_ADDR, i, 1); 
         if (status != BMS_OK) { BMS_DEBUG_PRINTF("Setting address %d failed\n", i); return status; }
     }
-    
 
-
+    // step 6
     Serial.println("  Configure BQ79616s as stack devices...");
     status = bqBroadcastWrite(COMM_CTRL, 0x02, 1); // STACK_DEV=1, TOP_STACK=0 for all BQ79616s
     if (status != BMS_OK) { Serial.println("Configure stack devices failed"); return status; }
 
+    // step 7
     if (NUM_BQ79616_DEVICES > 0) {
         Serial.println("  Configure Top of Stack device...");
         uint8_t tos_address = NUM_BQ79616_DEVICES; 
         status = bqWriteReg(tos_address, COMM_CTRL, 0x03, 1, FRMWRT_SGL_W); // STACK_DEV=1, TOP_STACK=1
         if (status != BMS_OK) { BMS_DEBUG_PRINTF("Configure ToS device (Addr %d) failed\n", tos_address); return status; }
     }
-    // Set BQ79600 (Bridge, device ID 0) as base device
-    status = bqWriteReg(BQ79600_BRIDGE_DEVICE_ID, COMM_CTRL, 0x00, 1, FRMWRT_SGL_W); // STACK_DEV=0, TOP_STACK=0
-    if (status != BMS_OK) { Serial.println("Configure bridge as base device failed"); return status; }
 
-    // attempting to do that special case
-    if (NUM_BQ79616_DEVICES == 1) {
-    status = bqWriteReg(1, COMM_CTRL, 0x01, 1, FRMWRT_SGL_W);
-    if (status != BMS_OK) return status;
-    }
+    // Gemini tried to do this but YOU DO NOT NEED TO DO THIS. (and it might mess things up?)
+    // // Set BQ79600 (Bridge, device ID 0) as base device
+    // status = bqWriteReg(BQ79600_BRIDGE_DEVICE_ID, COMM_CTRL, 0x00, 1, FRMWRT_SGL_W); // STACK_DEV=0, TOP_STACK=0
+    // if (status != BMS_OK) { Serial.println("Configure bridge as base device failed"); return status; }
 
+    // step 8 in datasheet
     Serial.println("  DLL Sync (dummy reads)...");
     uint8_t dummyReadBuf[MAX_READ_DATA_BYTES]; 
     for (uint16_t reg = OTP_ECC_DATAIN1; reg <= OTP_ECC_DATAIN8; ++reg) { 
@@ -315,6 +407,34 @@ BMSErrorCode_t bqAutoAddressStack() {
              BMS_DEBUG_PRINTF("Warning: Dummy stack read for DLL sync failed for reg 0x%X with status %d\n", reg, status);
              // Not returning error here as per TI guide for dummy reads
         }
+    }
+
+    /* ---- Step 9 : verify addresses by stack-reading DIR0_ADDR (0x0306) ---- */
+    Serial.println("  Verifying stack device addresses (DIR0_ADDR)...");
+    uint8_t addrBuf[NUM_BQ79616_DEVICES];                 // one byte per monitor
+    status = bqStackRead(DIR0_ADDR, addrBuf, 1);          // frames come Btm→Top
+    if (status != BMS_OK) {
+        Serial.println("  Address-verification read failed.");
+        return status;                                    // abort auto-address
+    }
+    /* print what each device reported */
+    for (uint8_t i = 0; i < NUM_BQ79616_DEVICES; ++i) {
+        Serial.print("    Dev "); Serial.print(i + 1);
+        Serial.print(" reports 0x"); Serial.println(addrBuf[i], HEX);
+    }
+
+    /* ---- Step 10 : read BQ79600 DEV_CONF1 (0x2001) and verify == 0x14 ---- */
+    Serial.println("  Verifying BQ79600-Q1 DEV_CONF1 (0x2001)...");
+    uint8_t devConf1 = 0;
+    status = bqReadReg(BQ79600_BRIDGE_DEVICE_ID, 0x2001, &devConf1, 1, FRMWRT_SGL_R);
+    if (status != BMS_OK) {
+        Serial.println("    DEV_CONF1 read failed.");
+        return status;
+    }
+    Serial.print ("    DEV_CONF1 = 0x"); Serial.println(devConf1, HEX);
+    if (devConf1 != 0x14) {
+        Serial.println("    ERROR: DEV_CONF1 mismatch (expected 0x14)");
+        return BMS_ERROR_INVALID_RESPONSE;
     }
     
     Serial.println("  Resetting communication faults from auto-addressing...");
@@ -330,7 +450,9 @@ BMSErrorCode_t bqAutoAddressStack() {
 }
 
 // In src/bq_comm.cpp -> bqConfigureBridgeForRing()
-// this is a problem child. 
+// this is a problem child. Maybe fix some other time. i dunno. 
+// the datasheet tells you how
+// just follow the stuff like above
 BMSErrorCode_t bqConfigureBridgeForRing() {
     Serial.println("Configuring BQ79600 bridge for Ring Architecture...");
     BMSErrorCode_t status;
@@ -365,6 +487,7 @@ BMSErrorCode_t bqConfigureBridgeForRing() {
 }
 
 // this will probably go away eventually, but its not going to be used right now
+// the functions this performed will probably get rolled into configure_stack() or something like that
 BMSErrorCode_t bqConfigureStackForHeartbeat() {
     Serial.println("Configuring BQ79616 stack for Heartbeat...");
     uint8_t devConfVal = BQ79616_HEARTBEAT_CONFIG; 
@@ -528,90 +651,3 @@ void bqDelayUs(unsigned int us) {
     delayMicroseconds(us);
 }
 
-BMSErrorCode_t bqBroadcastRead(uint16_t regAddr,
-                               uint8_t *readBuffer,
-                               uint8_t numBytesToRead,
-                               uint32_t timeout_ms /* = SERIAL_TIMEOUT_MS * TOTAL_BQ_DEVICES */)
-{
-    /* ---- argument sanity ---- */
-    if (readBuffer == nullptr ||
-        numBytesToRead == 0 ||
-        numBytesToRead > MAX_READ_DATA_BYTES)
-        return BMS_ERROR_INVALID_RESPONSE;
-#define BMS_DEBUG
-    if (regAddr < 0x0000 || regAddr > 0x3FFF) {
-        Serial.println(F("[BRD_R] Invalid register address"));
-        return BMS_ERROR_INVALID_RESPONSE;
-    }
-#ifdef BMS_DEBUG
-    Serial.print  (F("[BRD_R] reg 0x"));
-    Serial.print  (regAddr, HEX);
-    Serial.print  (F("  len "));
-    Serial.println(numBytesToRead);
-#endif
-
-    /* ---- 1. send the ALL_R command frame ---- */
-    BMSErrorCode_t st = buildAndSendFrame(
-        0, regAddr,
-        nullptr,
-        numBytesToRead,          /* LEN = bytes to read */
-        FRMWRT_ALL_R);           /* broadcast read opcode */
-    if (st != BMS_OK) {
-#ifdef BMS_DEBUG
-        Serial.println(F("[BRD_R] buildAndSendFrame failed"));
-#endif
-        return st;
-    }
-
-    /* ---- 2. receive response frames ---- */
-    constexpr size_t HDR_LEN  = 4;     /* INIT, ADDR, CMD, LEN */
-    constexpr size_t CRC_LEN  = 2;     /* 16-bit CRC           */
-    const     size_t FRAME_LEN  = HDR_LEN + numBytesToRead + CRC_LEN;
-    const     size_t TOTAL_LEN  = FRAME_LEN * TOTAL_BQ_DEVICES;
-
-    uint8_t rxBuf[TOTAL_LEN];
-    st = receiveFrame(rxBuf, TOTAL_LEN, timeout_ms);
-    if (st != BMS_OK) {
-#ifdef BMS_DEBUG
-        Serial.println(F("[BRD_R] receiveFrame timeout / UART error"));
-#endif
-        return st;
-    }
-
-#ifdef BMS_DEBUG
-    Serial.print  (F("[BRD_R] got "));
-    Serial.print  (TOTAL_LEN);
-    Serial.println(F(" bytes"));
-#endif
-
-    /* ---- 3. CRC check + copy data ---- */
-    for (size_t dev = 0; dev < TOTAL_BQ_DEVICES; ++dev) {
-        size_t off = dev * FRAME_LEN;
-
-        uint16_t crc_rx  = (rxBuf[off + FRAME_LEN - 1] << 8) |
-                            rxBuf[off + FRAME_LEN - 2];
-        uint16_t crc_cal = calculateCRC16(&rxBuf[off], FRAME_LEN - CRC_LEN);
-
-#ifdef BMS_DEBUG
-        Serial.print  (F("  frame["));
-        Serial.print  (dev);
-        Serial.print  (F("] INIT 0x"));
-        Serial.print  (rxBuf[off], HEX);
-        Serial.print  (F(" ADDR 0x"));
-        Serial.print  (rxBuf[off+1], HEX);
-        Serial.print  (F(" CRC "));
-        Serial.println(crc_rx == crc_cal ? F("OK") : F("FAIL"));
-#endif
-
-        if (crc_rx != crc_cal) return BMS_ERROR_CRC;
-
-        memcpy(readBuffer + dev * numBytesToRead,
-               &rxBuf[off + HDR_LEN],
-               numBytesToRead);
-    }
-
-#ifdef BMS_DEBUG
-    Serial.println(F("[BRD_R] success"));
-#endif
-    return BMS_OK;
-}
