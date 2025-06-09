@@ -21,7 +21,6 @@ extern FSM_State_t g_currentState;
 
 void fsm_init();
 void fsm_run(); 
-void read_and_print_bq_control_register(const char* stage_msg, uint8_t dev_id, uint16_t reg_addr, const char* reg_name);
 void action_initial();
 FSM_State_t transition_initial();
 void action_startup();

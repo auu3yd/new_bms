@@ -17,33 +17,24 @@ unsigned long g_lastCanTransmitTime = 0;
 unsigned long fault_startup_error_entry_ts = 0;
 static unsigned long startup_attempt_timestamp = 0;
 
-void read_and_print_bq_control_register(const char* stage_msg, uint8_t dev_id, uint16_t reg_addr, const char* reg_name) {
-    uint8_t current_val;
-    BMSErrorCode_t status = bqReadReg(dev_id, reg_addr, &current_val, 1, FRMWRT_SGL_R);
-    if (status == BMS_OK) {
-        BMS_DEBUG_PRINTF("%s: Dev 0x%02X Reg %s (0x%04X) = 0x%02X\n", stage_msg, dev_id, reg_name, reg_addr, current_val);
-    } else {
-        BMS_DEBUG_PRINTF("%s: Dev 0x%02X Reg %s (0x%04X) = READ FAILED (Error %d)\n", stage_msg, dev_id, reg_name, reg_addr, status);
-    }
-}
-
-const char* fsm_state_to_string(FSM_State_t state) {
-    switch (state) {
-        case FSM_STATE_INITIAL: return "INITIAL";
-        case FSM_STATE_STARTUP: return "STARTUP";
-        case FSM_STATE_NORMAL_OPERATION: return "NORMAL_OPERATION";
-        case FSM_STATE_CELL_BALANCING: return "CELL_BALANCING";
-        case FSM_STATE_FAULT_COMMUNICATION: return "FAULT_COMMUNICATION";
-        case FSM_STATE_FAULT_MEASUREMENT: return "FAULT_MEASUREMENT";
-        case FSM_STATE_FAULT_STARTUP_ERROR: return "FAULT_STARTUP_ERROR";
-        case FSM_STATE_FAULT_CRITICAL: return "FAULT_CRITICAL";
-        case FSM_STATE_SHUTDOWN_PROCEDURE: return "SHUTDOWN_PROCEDURE";
-        case FSM_STATE_SYSTEM_OFF: return "SYSTEM_OFF";
-        default: return "UNKNOWN_STATE";
-    }
-}
 
 void fsm_change_state(FSM_State_t newState) {
+    auto fsm_state_to_string = [](FSM_State_t state) -> const char* {
+        switch (state) {
+            case FSM_STATE_INITIAL: return "INITIAL";
+            case FSM_STATE_STARTUP: return "STARTUP";
+            case FSM_STATE_NORMAL_OPERATION: return "NORMAL_OPERATION";
+            case FSM_STATE_CELL_BALANCING: return "CELL_BALANCING";
+            case FSM_STATE_FAULT_COMMUNICATION: return "FAULT_COMMUNICATION";
+            case FSM_STATE_FAULT_MEASUREMENT: return "FAULT_MEASUREMENT";
+            case FSM_STATE_FAULT_STARTUP_ERROR: return "FAULT_STARTUP_ERROR";
+            case FSM_STATE_FAULT_CRITICAL: return "FAULT_CRITICAL";
+            case FSM_STATE_SHUTDOWN_PROCEDURE: return "SHUTDOWN_PROCEDURE";
+            case FSM_STATE_SYSTEM_OFF: return "SYSTEM_OFF";
+            default: return "UNKNOWN_STATE";
+        }
+    };
+
     if (g_currentState != newState) {
         BMS_DEBUG_PRINTF("FSM: %s -> %s\n", fsm_state_to_string(g_currentState), fsm_state_to_string(newState));
         g_currentState = newState;
@@ -160,6 +151,7 @@ float convertTemperatureToNtcVoltage(float temperatureC) {
     return v_ntc_volts * 1000.0f; 
 }
 
+// This might end up removed later. I might just reset the entire BMS if something goes wrong. 
 BMSErrorCode_t applyEssentialStackConfigsForRecovery(){
     Serial.println("Applying essential stack configurations for recovery...");
     BMSErrorCode_t status = BMS_OK;
@@ -255,7 +247,6 @@ void action_startup() {
     /* Mask-off UT, OT, and UV faults on every stack device (bits 6‒4 = 1) */
     status = bqStackWrite(FAULT_MSK1, 0x70, 1);   // 0x40 | 0x20 | 0x10 = 0x70
     // REMOVE THIS BEFORE EVER ALLOWING THIS TO CONNECT TO ACTUAL CELLS
-    // THIS CAN KILL PEOPLE IF YOU ARE NEGLIGENT 
 
 
     // 5. Final Fault Reset
@@ -362,7 +353,7 @@ FSM_State_t transition_normal_operation() {
 }
 
 void action_cell_balancing() {
-    // Serial.println("Action: CELL_BALANCING");
+    Serial.println("Action: CELL_BALANCING");
     BMSErrorCode_t comm_status;
     bool current_cycle_comm_ok = true;
 
@@ -375,6 +366,9 @@ void action_cell_balancing() {
     updatePackStatistics(&g_bmsData);
     g_bmsData.stateOfCharge_pct = estimateSOC(&g_bmsData);
     bool new_balancing_started_this_action = false;
+
+    printCellData(&g_bmsData);
+
 
     for (uint8_t mod_idx = 0; mod_idx < NUM_BQ79616_DEVICES; ++mod_idx) {
         // Check status of currently balancing cells
