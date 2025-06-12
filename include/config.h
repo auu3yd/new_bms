@@ -4,7 +4,7 @@
 #include <Arduino.h>
 
 // BMS Stack Configuration
-#define NUM_BQ79616_DEVICES 2
+#define NUM_BQ79616_DEVICES 6
 #define TOTAL_BQ_DEVICES (NUM_BQ79616_DEVICES + 1) 
 #define CELLS_PER_SLAVE 16 
 #define TEMP_SENSORS_PER_SLAVE 8 
@@ -53,9 +53,9 @@
 
 // Safety Thresholds
 #define MAX_CELL_VOLTAGE_MV 4200
-#define MIN_CELL_VOLTAGE_MV 1000
-#define MAX_CELL_TEMP_C 60
-#define MIN_CELL_TEMP_C 0
+#define MIN_CELL_VOLTAGE_MV 3000
+#define MAX_CELL_TEMP_C 55
+#define MIN_CELL_TEMP_C 10
 #define MAX_BQ_DIE_TEMP_C 85
 #define OV_HYSTERESIS_MV 200
 #define UV_HYSTERESIS_MV 200

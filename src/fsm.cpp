@@ -8,6 +8,7 @@
 #include <math.h>        
 #include <string.h> 
 
+// Voltage thresholds are defined in config.h; do not redefine here.
 
 FSM_State_t g_currentState;
 // BMSOverallData_t g_bmsData; // Definition moved to bq_data.cpp
@@ -29,8 +30,6 @@ void fsm_change_state(FSM_State_t newState) {
             case FSM_STATE_FAULT_MEASUREMENT: return "FAULT_MEASUREMENT";
             case FSM_STATE_FAULT_STARTUP_ERROR: return "FAULT_STARTUP_ERROR";
             case FSM_STATE_FAULT_CRITICAL: return "FAULT_CRITICAL";
-            case FSM_STATE_SHUTDOWN_PROCEDURE: return "SHUTDOWN_PROCEDURE";
-            case FSM_STATE_SYSTEM_OFF: return "SYSTEM_OFF";
             default: return "UNKNOWN_STATE";
         }
     };
@@ -41,6 +40,40 @@ void fsm_change_state(FSM_State_t newState) {
     }
 }
 
+volatile bool imd_fault_latched = false;
+volatile unsigned long imd_isr_trigger_time = 0;
+
+void imd_fault() {
+    imd_fault_latched = true;
+    g_bmsData.imd_status_ok = false;
+    digitalWrite(IMD_ERROR_PIN, HIGH);
+    g_bmsData.balancing_request = false;
+    g_bmsData.balancing_cycle_active = false;
+    for (int i = 0; i < NUM_BQ79616_DEVICES; ++i) {
+        g_bmsData.activeBalancingCells[i] = 0;
+    }
+    while (true) {
+        // Stay here forever, system is halted due to IMD fault
+        can_send_bms_data(&g_bmsData);
+        send_pack_data(&g_bmsData);
+        delay(1000);
+    }
+}
+
+void imd_isr() {
+    static unsigned long imd_fall_time = 0;
+    if (digitalRead(IMD_STATUS_PIN) == LOW) { // Fault asserted
+        if (imd_fall_time == 0) {
+            imd_fall_time = millis();
+        }
+        if ((millis() - imd_fall_time) >= 3000) {
+            imd_fault();
+        }
+    } else {
+        imd_fall_time = 0; // Pin released, reset timer
+    }
+}
+
 void fsm_init() {
     Serial.println("FSM Init");
     memset(&g_bmsData, 0, sizeof(BMSOverallData_t)); // Initialize global BMS data
@@ -48,9 +81,11 @@ void fsm_init() {
     bqInitCommunication(); 
     can_init();
 
+
     pinMode(FAN_PIN, OUTPUT); digitalWrite(FAN_PIN, LOW);
     pinMode(RESET_PIN, INPUT_PULLDOWN); 
     pinMode(IMD_STATUS_PIN, INPUT_PULLDOWN); // Assuming pull-down if signal is active HIGH for OK
+    attachInterrupt(digitalPinToInterrupt(IMD_STATUS_PIN), imd_isr, FALLING);
     pinMode(POS_AIR_STATUS_PIN, INPUT_PULLDOWN);
     pinMode(NEG_AIR_STATUS_PIN, INPUT_PULLDOWN);
     pinMode(IMD_ERROR_PIN, OUTPUT); digitalWrite(IMD_ERROR_PIN, LOW);
@@ -79,8 +114,6 @@ void fsm_run() {
         case FSM_STATE_FAULT_MEASUREMENT: action_fault_measurement(); break;
         case FSM_STATE_FAULT_STARTUP_ERROR: action_fault_startup_error(); break;
         case FSM_STATE_FAULT_CRITICAL: action_fault_critical(); break;
-        case FSM_STATE_SHUTDOWN_PROCEDURE: action_shutdown_procedure(); break;
-        case FSM_STATE_SYSTEM_OFF: action_system_off(); break;
         default: Serial.println("FSM: Unknown state in action dispatch!"); break;
     }
 
@@ -95,8 +128,6 @@ void fsm_run() {
         case FSM_STATE_FAULT_MEASUREMENT: nextState = transition_fault_measurement(); break;
         case FSM_STATE_FAULT_STARTUP_ERROR: nextState = transition_fault_startup_error(); break;
         case FSM_STATE_FAULT_CRITICAL: nextState = transition_fault_critical(); break;
-        case FSM_STATE_SHUTDOWN_PROCEDURE: nextState = transition_shutdown_procedure(); break;
-        case FSM_STATE_SYSTEM_OFF: nextState = transition_system_off(); break; 
         default:
             Serial.println("FSM: Unknown state in transition dispatch! Resetting to INITIAL.");
             nextState = FSM_STATE_INITIAL;
@@ -113,71 +144,15 @@ void fsm_run() {
             g_lastCanTransmitTime = millis();
         }
     }
+
+    // --- Always print BMS data at the end of each FSM cycle ---
+    send_pack_data(&g_bmsData);
 }
 
-float convertTemperatureToNtcVoltage(float temperatureC) {
-    float min_R = 10.0f;      
-    float max_R = 500000.0f;  
-    float best_R = NTC_R_REF;  
-    float min_temp_diff_at_best_R = 1000.0f; // Store the diff for best_R
-
-    int iterations = 100; 
-    for (int i = 0; i < iterations; ++i) {
-        float mid_R = (min_R + max_R) / 2.0f;
-        if (mid_R <= 0.1f) mid_R = 0.1f; 
-        
-        float calc_temp = resistanceToTemperature(mid_R); // Ensure resistanceToTemperature is declared in bq_data.h
-        float temp_diff = calc_temp - temperatureC;
-
-        if (fabsf(temp_diff) < min_temp_diff_at_best_R) { // If this R is better
-             min_temp_diff_at_best_R = fabsf(temp_diff);
-             best_R = mid_R;
-        }
-
-        if (fabsf(temp_diff) < 0.01f) { 
-            break; 
-        }
-
-        if (temp_diff < 0) { 
-            max_R = mid_R;
-        } else { 
-            min_R = mid_R;
-        }
-        // best_R already updated if mid_R was better.
-    }
-    // BMS_DEBUG_PRINTF("Temp %.1fC -> Best R %.0f Ohm (final diff %.2fC)\n", temperatureC, best_R, min_temp_diff_at_best_R);
-    
-    float v_ntc_volts = (NTC_V_TSREF * best_R) / (NTC_R_DIVIDER + best_R);
-    return v_ntc_volts * 1000.0f; 
-}
 
 // This might end up removed later. I might just reset the entire BMS if something goes wrong. 
-BMSErrorCode_t applyEssentialStackConfigsForRecovery(){
-    Serial.println("Applying essential stack configurations for recovery...");
-    BMSErrorCode_t status = BMS_OK;
-    BMSErrorCode_t current_op_status;
-
-    uint8_t reg_val_8bit = (uint8_t)(CELLS_PER_SLAVE - 1);
-    current_op_status = bqStackWrite(ACTIVE_CELL, reg_val_8bit, 1);
-    if(current_op_status != BMS_OK) { Serial.println("Recovery: Failed ACTIVE_CELL"); status = current_op_status;}
-
-    // Read-modify-write for CONTROL2 is tricky for stack. Sample writes 0x01.
-    current_op_status = bqStackWrite(CONTROL2, 0x01, 1); // TSREF_EN
-    if(current_op_status != BMS_OK) { Serial.println("Recovery: Failed CONTROL2"); if(status == BMS_OK) status = current_op_status;}
-    
-    delayMicroseconds(1); // For TSREF
-
-    current_op_status = bqStackWrite(ADC_CTRL1, 0x0E, 1); // MAIN_GO=1, Continuous
-    if(current_op_status != BMS_OK) { Serial.println("Recovery: Failed ADC_CTRL1"); if(status == BMS_OK) status = current_op_status;}
-    
-    // Re-enable protectors
-    current_op_status = bqStackWrite(OVUV_CTRL, 0x07, 1); 
-    if(current_op_status != BMS_OK) { Serial.println("Recovery: Failed OVUV_CTRL"); if(status == BMS_OK) status = current_op_status;}
-    current_op_status = bqStackWrite(OTUT_CTRL, 0x05, 1); 
-    if(current_op_status != BMS_OK) { Serial.println("Recovery: Failed OTUT_CTRL"); if(status == BMS_OK) status = current_op_status;}
-
-    return status;
-}
+// Removed: applyEssentialStackConfigsForRecovery()
+// If recovery is needed, transition to STARTUP and attempt full boot sequence again.
 
 void action_initial() { }
 FSM_State_t transition_initial() { return FSM_STATE_STARTUP; }
@@ -186,7 +161,6 @@ void action_startup() {
     Serial.println("Action: STARTUP");
     BMSErrorCode_t status;
     uint8_t reg_val_8bit;
-    uint8_t dummy_read_buffer[MAX_READ_DATA_BYTES]; 
     
     g_bmsData.communicationFault = false; 
     // fault_startup_error_entry_ts is managed by fsm_change_state
@@ -242,11 +216,11 @@ void action_startup() {
     if (retFlag)
         return;
 
-    Serial.println("[4.5] Disabling OV/UV and OT/UT faults on all stack devices...");
-    Serial.println("[WARNING!!!!!] THIS IS DANGEROUS! DO NOT USE THIS IN PRODUCTION!");
-    /* Mask-off UT, OT, and UV faults on every stack device (bits 6‒4 = 1) */
+    // Serial.println("[4.5] Disabling OV/UV and OT/UT faults on all stack devices...");
+    // Serial.println("[WARNING!!!!!] THIS IS DANGEROUS! DO NOT USE THIS IN PRODUCTION!");
+    // /* Mask-off UT, OT, and UV faults on every stack device (bits 6‒4 = 1) */
     status = bqStackWrite(FAULT_MSK1, 0x70, 1);   // 0x40 | 0x20 | 0x10 = 0x70
-    // REMOVE THIS BEFORE EVER ALLOWING THIS TO CONNECT TO ACTUAL CELLS
+    // // REMOVE THIS BEFORE EVER ALLOWING THIS TO CONNECT TO ACTUAL CELLS
 
 
     // 5. Final Fault Reset
@@ -284,7 +258,7 @@ void action_normal_operation() {
 
     status = bqGetAllTemperatures(&g_bmsData);
     if (status != BMS_OK) current_cycle_comm_ok = false;
-    printCellData(&g_bmsData);
+    send_pack_data(&g_bmsData);
     //status = bqGetStackFaultStatus(&g_bmsData); 
     if (status != BMS_OK) current_cycle_comm_ok = false;
 
@@ -341,171 +315,143 @@ FSM_State_t transition_normal_operation() {
         Serial.println("Transitioning to FAULT_CRITICAL due to unspecified NFAULT assertion.");
         return FSM_STATE_FAULT_CRITICAL; 
     }
-    if (g_bmsData.balancing_request && !g_bmsData.balancing_cycle_active) { // Request and not already in a cycle from last time
+    if (g_bmsData.balancing_request && !g_bmsData.balancing_cycle_active) {
+        BMSErrorCode_t status = bqStartCellBalancing(&g_bmsData);
+        if (status != BMS_OK) {
+            Serial.println("Failed to start cell balancing.");
+            // Optionally set a fault or handle error here
+        }
         return FSM_STATE_CELL_BALANCING;
     }
-    // no fucking clue why this is here but whatev
-    // if (g_bmsData.reset_pin_active) { 
-    //     Serial.println("Reset pin detected, initiating shutdown.");
-    //     return FSM_STATE_SHUTDOWN_PROCEDURE;
-    // }
     return FSM_STATE_NORMAL_OPERATION;
 }
 
 void action_cell_balancing() {
-    Serial.println("Action: CELL_BALANCING");
-    BMSErrorCode_t comm_status;
-    bool current_cycle_comm_ok = true;
+    Serial.println("Action: CELL_BALANCING (monitoring)");
 
-    comm_status = bqGetAllCellVoltages(&g_bmsData); if (comm_status != BMS_OK) current_cycle_comm_ok = false;
-    comm_status = bqGetAllTemperatures(&g_bmsData); if (comm_status != BMS_OK) current_cycle_comm_ok = false;
-    comm_status = bqGetStackFaultStatus(&g_bmsData); if (comm_status != BMS_OK) current_cycle_comm_ok = false;
-    comm_status = bqGetBridgeFaultStatus(&g_bmsData); if (comm_status != BMS_OK) current_cycle_comm_ok = false;
+    BMSErrorCode_t status;
+    bool current_cycle_comm_ok = true;
+    bool all_balancing_done = true;
+
+    status = bqGetAllCellVoltages(&g_bmsData);
+    if (status != BMS_OK) current_cycle_comm_ok = false;
+
+    status = bqGetAllTemperatures(&g_bmsData);
+    if (status != BMS_OK) current_cycle_comm_ok = false;
+
+    send_pack_data(&g_bmsData);
+
+    status = bqGetStackFaultStatus(&g_bmsData);
+    if (status != BMS_OK) current_cycle_comm_ok = false;
+
+    status = bqGetBridgeFaultStatus(&g_bmsData);
+    if (status != BMS_OK) current_cycle_comm_ok = false;
+
     g_bmsData.communicationFault = !current_cycle_comm_ok;
-    
+
     updatePackStatistics(&g_bmsData);
     g_bmsData.stateOfCharge_pct = estimateSOC(&g_bmsData);
-    bool new_balancing_started_this_action = false;
 
-    printCellData(&g_bmsData);
+    // Fan and error pin logic
+    bool any_temp_high = false;
+    for (int i = 0; i < NUM_BQ79616_DEVICES; ++i) {
+        for (int j = 0; j < TEMP_SENSORS_PER_SLAVE; ++j) {
+            if (g_bmsData.modules[i].cellTemperatures[j] > 350) { 
+                any_temp_high = true; break;
+            }
+        }
+        if (any_temp_high) break;
+    }
+    digitalWrite(FAN_PIN, any_temp_high ? HIGH : LOW);
+    digitalWrite(IMD_ERROR_PIN, g_bmsData.imd_status_ok ? LOW : HIGH);
+    digitalWrite(AMS_ERROR_PIN, g_bmsData.overallFaultStatus ? HIGH : LOW);
 
-
+    // --- Monitor CB_COMPLETE1, CB_COMPLETE2, and BAL_CTRL2 ---
     for (uint8_t mod_idx = 0; mod_idx < NUM_BQ79616_DEVICES; ++mod_idx) {
-        // Check status of currently balancing cells
-        if (g_bmsData.activeBalancingCells[mod_idx] != 0) {
-            new_balancing_started_this_action = true; // Still actively managing balancing
-            bqCheckBalancingStatus(mod_idx, &g_bmsData);
-            
-            uint16_t completed_mask = g_bmsData.modules[mod_idx].cb_complete1;
-            uint8_t previously_active = g_bmsData.activeBalancingCells[mod_idx];
-            uint8_t still_active_after_completion_check = previously_active & ~completed_mask;
-            
-            if ((previously_active & completed_mask) != 0) { // Some cells finished
-                 BMS_DEBUG_PRINTF("Mod %d: Cells with mask 0x%X completed balancing.\n", mod_idx, (previously_active & completed_mask));
-            }
-            g_bmsData.activeBalancingCells[mod_idx] = still_active_after_completion_check;
+        uint8_t bal_stat = 0;
+        uint8_t cb_complete_buf[2] = {0};
+        uint8_t bal_ctrl2 = 0;
+
+        // Read BAL_STAT
+        status = bqReadReg(mod_idx + 1, BAL_STAT, &bal_stat, 1, FRMWRT_SGL_R, SERIAL_TIMEOUT_MS);
+        if (status == BMS_OK) {
+            Serial.print("Module ");
+            Serial.print(mod_idx + 1);
+            Serial.print(" BAL_STAT: 0x");
+            Serial.println(bal_stat, HEX);
+        } else {
+            Serial.print("Module ");
+            Serial.print(mod_idx + 1);
+            Serial.println(" BAL_STAT read error");
         }
 
-        // Decide if new balancing needs to start on this module (only if no cells currently active on it)
-        if (g_bmsData.activeBalancingCells[mod_idx] == 0) { 
-            uint16_t min_v_module = 5000, max_v_module = 0;
-            for (int c = 0; c < CELLS_PER_SLAVE; ++c) {
-                uint16_t v = g_bmsData.modules[mod_idx].cellVoltages[c];
-                if (v < 1000 || v > 5000) continue;
-                if (v < min_v_module) min_v_module = v;
-                if (v > max_v_module) max_v_module = v;
-            }
+        // Read CB_COMPLETE1 and CB_COMPLETE2
+        status = bqReadReg(mod_idx + 1, CB_COMPLETE1, cb_complete_buf, 2, FRMWRT_SGL_R, SERIAL_TIMEOUT_MS);
+        if (status == BMS_OK) {
+            Serial.print("Module ");
+            Serial.print(mod_idx + 1);
+            Serial.print(" CB_COMPLETE1: 0x");
+            Serial.print(cb_complete_buf[0], HEX);
+            Serial.print(" CB_COMPLETE2: 0x");
+            Serial.println(cb_complete_buf[1], HEX);
 
-            if ((max_v_module - min_v_module) > CELL_BALANCE_VOLTAGE_DIFF_THRESHOLD_MV && 
-                 max_v_module < MAX_VOLTAGE_FOR_BALANCING_MV && 
-                 max_v_module > MIN_VOLTAGE_FOR_BALANCING_MV) { // Check max_v_module against min range too
-                
-                uint8_t cells_to_balance_mask_this_module = 0;
-                uint16_t sorted_voltages[CELLS_PER_SLAVE];
-                uint8_t sorted_indices[CELLS_PER_SLAVE];
-
-                for(int c=0; c<CELLS_PER_SLAVE; ++c) {
-                    sorted_voltages[c] = g_bmsData.modules[mod_idx].cellVoltages[c];
-                    sorted_indices[c] = c;
-                }
-                // Simple bubble sort to find top N cells
-                for(int k=0; k < CELLS_PER_SLAVE-1; ++k) {
-                    for(int m=0; m < CELLS_PER_SLAVE-k-1; ++m) {
-                        if(sorted_voltages[m] < sorted_voltages[m+1]) {
-                            uint16_t temp_v = sorted_voltages[m]; sorted_voltages[m] = sorted_voltages[m+1]; sorted_voltages[m+1] = temp_v;
-                            uint8_t temp_i = sorted_indices[m]; sorted_indices[m] = sorted_indices[m+1]; sorted_indices[m+1] = temp_i;
-                        }
-                    }
-                }
-                
-                for(int k=0; k < NUM_CELLS_TO_BALANCE_SIMULTANEOUSLY_PER_MODULE; ++k) {
-                    if (k >= CELLS_PER_SLAVE) break; // Should not happen
-                    uint16_t cell_v = sorted_voltages[k];
-                    uint8_t cell_idx = sorted_indices[k];
-                    if (cell_v > MIN_VOLTAGE_FOR_BALANCING_MV && cell_v < MAX_VOLTAGE_FOR_BALANCING_MV &&
-                        cell_v > (min_v_module + (CELL_BALANCE_VOLTAGE_DIFF_THRESHOLD_MV / 2)) ) { // Ensure it's significantly higher than min
-                        cells_to_balance_mask_this_module |= (1 << cell_idx);
-                    } else {
-                        break; // Stop if cells are not eligible or not high enough
-                    }
-                }
-                
-                if (cells_to_balance_mask_this_module != 0) {
-                    BMS_DEBUG_PRINTF("Module %d: Starting balancing. MinV: %dmV, MaxV: %dmV. Mask: 0x%X\n", mod_idx, min_v_module, max_v_module, cells_to_balance_mask_this_module);
-                    for(int c=0; c < CELLS_PER_SLAVE; ++c) { // Start one by one
-                        if((cells_to_balance_mask_this_module >> c) & 0x01) {
-                            comm_status = bqStartCellBalancing(&g_bmsData, mod_idx, c, BALANCING_DURATION_CODE);
-                            if (comm_status != BMS_OK) {
-                                g_bmsData.communicationFault = true;
-                                BMS_DEBUG_PRINTF("Error starting balance on Mod %d Cell %d\n", mod_idx, c);
-                            } else {
-                                new_balancing_started_this_action = true;
-                            }
-                        }
-                    }
-                }
+            if (cb_complete_buf[0] != 0xFF || cb_complete_buf[1] != 0xFF) {
+                all_balancing_done = false;
             }
+        } else {
+            Serial.print("Module ");
+            Serial.print(mod_idx + 1);
+            Serial.println(" CB_COMPLETE read error");
+            all_balancing_done = false;
         }
-    } 
-    g_bmsData.balancing_cycle_active = new_balancing_started_this_action; // Update global flag
+
+        // Read BAL_CTRL2 to check bit 1 (BAL_GO)
+        // status = bqReadReg(mod_idx + 1, BAL_CTRL2, &bal_ctrl2, 1, FRMWRT_SGL_R, SERIAL_TIMEOUT_MS);
+        // if (status == BMS_OK) {
+        //     if ((bal_ctrl2 & (1 << 1)) == 0) {
+        //         Serial.print("Module ");
+        //         Serial.print(mod_idx + 1);
+        //         Serial.println(" BAL_GO bit cleared, ending balancing.");
+        //         g_bmsData.balancing_cycle_active = false;
+        //     }
+        // }
+    }
+
+    // If all modules are done, clear balancing
+    if (all_balancing_done) {
+        Serial.println("All modules report CB_COMPLETE1/2 == 0xFF. Balancing done.");
+        g_bmsData.balancing_cycle_active = false;
+    }
 }
 
 FSM_State_t transition_cell_balancing() {
     if (g_faultState.comm_fault_confirmed || g_faultState.bridge_comm_fault_confirmed || g_faultState.stack_heartbeat_fault_confirmed) {
         for (uint8_t mod_idx = 0; mod_idx < NUM_BQ79616_DEVICES; ++mod_idx) {
             if (g_bmsData.activeBalancingCells[mod_idx] != 0) {
-                for(int c=0; c < CELLS_PER_SLAVE; ++c) if((g_bmsData.activeBalancingCells[mod_idx] >> c) & 0x01) bqStopCellBalancing(mod_idx, c);
+                bqStopCellBalancing(&g_bmsData);
                 g_bmsData.activeBalancingCells[mod_idx] = 0;
             }
         }
-        g_bmsData.balancing_cycle_active = false; g_bmsData.balancing_request = false;
+        g_bmsData.balancing_cycle_active = false; 
+        g_bmsData.balancing_request = false;
         return FSM_STATE_FAULT_COMMUNICATION;
     }
     if (g_faultState.ovuv_fault_confirmed || g_faultState.otut_fault_confirmed) {
         for (uint8_t mod_idx = 0; mod_idx < NUM_BQ79616_DEVICES; ++mod_idx) { /* Stop balancing */ }
-        g_bmsData.balancing_cycle_active = false; g_bmsData.balancing_request = false;
+        g_bmsData.balancing_cycle_active = false; 
+        g_bmsData.balancing_request = false;
         return FSM_STATE_FAULT_MEASUREMENT;
     }
     if (g_faultState.unspecified_n_fault_confirmed) {
         for (uint8_t mod_idx = 0; mod_idx < NUM_BQ79616_DEVICES; ++mod_idx) { /* Stop balancing */ }
-        g_bmsData.balancing_cycle_active = false; g_bmsData.balancing_request = false;
+        g_bmsData.balancing_cycle_active = false; 
+        g_bmsData.balancing_request = false;
         return FSM_STATE_FAULT_CRITICAL;
     }
 
-    float min_v_overall = 5000.0f, max_v_overall = 0.0f;
-     if (NUM_BQ79616_DEVICES > 0) {
-        min_v_overall = g_bmsData.minCellVoltage_mV;
-        max_v_overall = g_bmsData.maxCellVoltage_mV;
-    }
+    // Remove all logic that checks voltage delta or balancing thresholds
 
-    bool any_cell_still_active = false;
-    for(int i=0; i<NUM_BQ79616_DEVICES; ++i) {
-        if (g_bmsData.activeBalancingCells[i] != 0) {
-            any_cell_still_active = true; 
-            break;
-        }
-    }
-
-    if (!any_cell_still_active && (max_v_overall - min_v_overall <= TARGET_BALANCED_VOLTAGE_DIFF_MV)) {
-        Serial.println("Cell balancing complete. Pack delta <= target.");
-        g_bmsData.balancing_request = false;
-        g_bmsData.balancing_cycle_active = false;
-        return FSM_STATE_NORMAL_OPERATION;
-    }
-    
-    if (!any_cell_still_active && !g_bmsData.balancing_cycle_active) { 
-        if ((max_v_overall - min_v_overall) <= CELL_BALANCE_VOLTAGE_DIFF_THRESHOLD_MV) { // Not much more to do
-             Serial.println("Cell balancing paused (delta small or no eligible cells).");
-             g_bmsData.balancing_request = false; 
-             return FSM_STATE_NORMAL_OPERATION;
-        } else if (max_v_overall >= MAX_VOLTAGE_FOR_BALANCING_MV || min_v_overall <= MIN_VOLTAGE_FOR_BALANCING_MV){
-            Serial.println("Cell balancing paused (voltages out of safe balancing range).");
-            g_bmsData.balancing_request = false;
-            return FSM_STATE_NORMAL_OPERATION;
-        }
-    }
-    // If still requested (e.g. from normal_op) or a cycle is active, stay.
-    // action_cell_balancing will decide if new cells can be started.
+    // If still requested (e.g. from normal_op) or a cycle is active, stay in balancing
     if(g_bmsData.balancing_request || g_bmsData.balancing_cycle_active) {
         return FSM_STATE_CELL_BALANCING; 
     }
@@ -518,63 +464,35 @@ FSM_State_t transition_cell_balancing() {
 
 void action_fault_communication() {
     Serial.println("Action: FAULT_COMMUNICATION");
-    
-    if (g_faultState.comm_fault_retries < 3) {
-        BMS_DEBUG_PRINTF("Attempting communication fault recovery (Retry %d)...\n", g_faultState.comm_fault_retries + 1);
-        
-        Serial.println("Performing full stack re-initialization for recovery...");
-        BMSErrorCode_t status_recovery = BMS_OK;
-        
-        if(bqWakePing() != BMS_OK) status_recovery = BMS_ERROR_WAKEUP_FAILED;
-        if(status_recovery == BMS_OK && bqWakeUpStack() != BMS_OK) status_recovery = BMS_ERROR_WAKEUP_FAILED;
-        if(status_recovery == BMS_OK && bqConfigureBridgeForRing() != BMS_OK) status_recovery = BMS_ERROR_CONFIG_FAILED;
-        if(status_recovery == BMS_OK && bqAutoAddressStack() != BMS_OK) status_recovery = BMS_ERROR_AUTOADDRESS_FAILED;
-        if(status_recovery == BMS_OK && applyEssentialStackConfigsForRecovery() != BMS_OK) status_recovery = BMS_ERROR_CONFIG_FAILED;
-        if(status_recovery == BMS_OK && bqConfigureStackForHeartbeat() != BMS_OK) status_recovery = BMS_ERROR_CONFIG_FAILED;
-
-        if (status_recovery == BMS_OK) {
-            BMSErrorCode_t reset_status = resetAllBQFaults(); 
-            if(reset_status == BMS_OK){
-                Serial.println("Recovery: BQ faults cleared. Software confirmed faults also cleared.");
-                // resetAllBQFaults now also clears software confirmed flags and timers.
-                // We need to re-evaluate if underlying comms issue is resolved.
-                // Forcing a clear of immediate bmsData.communicationFault to allow next cycle check.
-                g_bmsData.communicationFault = false; 
-            } else {
-                Serial.println("Recovery: Failed to reset BQ faults.");
-            }
-        } else {
-             BMS_DEBUG_PRINTF("Recovery: Re-initialization failed with code %d.\n", status_recovery);
-        }
-        g_faultState.comm_fault_retries++;
-    } else {
-         Serial.println("Communication fault persists after max retries during FSM fault state.");
-    }
+    // No more retries or stack re-init here; just wait for transition
 }
 
 FSM_State_t transition_fault_communication() {
-    // processBMSFaults will update confirmed flags based on current state of g_bmsData.communicationFault etc.
-    // If recovery was successful, g_bmsData.communicationFault would be false, leading to g_faultState flags clearing.
-    if (!g_faultState.comm_fault_confirmed && !g_faultState.bridge_comm_fault_confirmed && !g_faultState.stack_heartbeat_fault_confirmed) {
-        Serial.println("Comm fault condition appears resolved after recovery attempt. Transitioning to STARTUP.");
-        g_faultState.comm_fault_retries = 0; 
-        return FSM_STATE_STARTUP; 
+    static unsigned long last_attempt_time = 0;
+    unsigned long now = millis();
+
+    // Every 10 seconds, try to re-enter STARTUP to re-establish communications
+    if (last_attempt_time == 0 || (now - last_attempt_time) > 10000) {
+        last_attempt_time = now;
+        Serial.println("Attempting to re-enter STARTUP from FAULT_COMMUNICATION to re-establish communications.");
+        return FSM_STATE_STARTUP;
     }
-    if(g_faultState.comm_fault_retries >= 3 && 
-       (g_faultState.comm_fault_confirmed || g_faultState.bridge_comm_fault_confirmed || g_faultState.stack_heartbeat_fault_confirmed) ) { 
-        Serial.println("Max comm recovery retries reached, escalating to CRITICAL FAULT.");
-        return FSM_STATE_FAULT_CRITICAL; 
-    }
-    return FSM_STATE_FAULT_COMMUNICATION; 
+    return FSM_STATE_FAULT_COMMUNICATION;
 }
 
 void action_fault_measurement() {
     Serial.println("Action: FAULT_MEASUREMENT (OV/UV/OT/UT)");
-    if(g_faultState.ovuv_fault_confirmed) Serial.println("Confirmed OV/UV Fault Active!");
-    if(g_faultState.otut_fault_confirmed) Serial.println("Confirmed OT/UT Fault Active!");
+    if(g_faultState.ovuv_fault_confirmed) {
+        Serial.println("Confirmed OV/UV Fault Active!");
+    }
+    if(g_faultState.ovuv_fault_confirmed) {
+        Serial.println("Confirmed OV/UV Fault Active!");
+    }
+    send_pack_data(&g_bmsData); // Still print all cell data
 }
 
 FSM_State_t transition_fault_measurement() {
+    // this might end up removed, because once NFAULT is triggered, it will latch until the entire system is reset. 
     if (!g_faultState.ovuv_fault_confirmed && !g_faultState.otut_fault_confirmed) {
         Serial.println("Measurement fault condition cleared.");
         return FSM_STATE_NORMAL_OPERATION;
@@ -585,7 +503,6 @@ FSM_State_t transition_fault_measurement() {
 void action_fault_startup_error() {
     Serial.println("Action: FAULT_STARTUP_ERROR - System initialization failed.");
     delay(2000);
-    // Log specific startup error. Limited functionality.
 }
 
 FSM_State_t transition_fault_startup_error() {
@@ -608,6 +525,7 @@ FSM_State_t transition_fault_startup_error() {
 
 void action_fault_critical() {
     Serial.println("Action: FAULT_CRITICAL - System Halted. Manual intervention required.");
+    processBMSFaults(&g_bmsData); // Ensure faults are processed
     printBQDump(); 
     static bool dump_done = false;
     if(!dump_done) {
@@ -618,43 +536,29 @@ void action_fault_critical() {
 }
 
 FSM_State_t transition_fault_critical() {
-    return FSM_STATE_FAULT_CRITICAL; 
-}
-
-void action_shutdown_procedure() {
-    Serial.println("Action: SHUTDOWN_PROCEDURE");
-    // 1. Command contactors to open (not implemented here, assumes external)
-    // 2. Save critical data (not implemented)
-    // 3. Command BQ devices to SHUTDOWN
-    BMSErrorCode_t status = bqShutdownDevices();
-    if (status == BMS_OK) {
-        Serial.println("Shutdown command sent successfully to BQ devices.");
-    } else {
-        Serial.println("Error sending shutdown command to BQ devices.");
+    // Check for other fault conditions and transition accordingly
+    if (g_faultState.comm_fault_confirmed || g_faultState.bridge_comm_fault_confirmed || g_faultState.stack_heartbeat_fault_confirmed) {
+        Serial.println("Exiting CRITICAL FAULT: Communication fault detected, transitioning to FAULT_COMMUNICATION.");
+        return FSM_STATE_FAULT_COMMUNICATION;
     }
-}
-
-FSM_State_t transition_shutdown_procedure() {
-    static unsigned long shutdown_initiated_time = 0;
-    if (shutdown_initiated_time == 0) shutdown_initiated_time = millis();
-
-    if (millis() - shutdown_initiated_time > 1000) { 
-        shutdown_initiated_time = 0; // Reset for next potential shutdown
-        return FSM_STATE_SYSTEM_OFF;
+    if (g_faultState.ovuv_fault_confirmed || g_faultState.otut_fault_confirmed) {
+        Serial.println("Exiting CRITICAL FAULT: Measurement fault detected, transitioning to FAULT_MEASUREMENT.");
+        return FSM_STATE_FAULT_MEASUREMENT;
     }
-    return FSM_STATE_SHUTDOWN_PROCEDURE;
-}
-
-void action_system_off() {
-    Serial.println("Action: SYSTEM_OFF. MCU can enter low power or wait for reset.");
-    digitalWrite(AMS_FAULT_PIN, LOW); // Clear fault pin if system is intentionally off
-    // Optional: Enter MCU deep sleep mode
-    while(true) {
-        delayMicroseconds(5000); // Stay here, do nothing actively
+    if (g_faultState.comm_fault_retries >= 3) {
+        Serial.println("Remaining in CRITICAL FAULT: Max communication retries reached.");
+        return FSM_STATE_FAULT_CRITICAL;
     }
+    // If no other faults, try to recover to startup
+    if (!g_faultState.comm_fault_confirmed && !g_faultState.bridge_comm_fault_confirmed &&
+        !g_faultState.stack_heartbeat_fault_confirmed &&
+        !g_faultState.ovuv_fault_confirmed && !g_faultState.otut_fault_confirmed) {
+        Serial.println("Exiting CRITICAL FAULT: No faults detected, transitioning to STARTUP.");
+        return FSM_STATE_STARTUP;
+    }
+    // Default: remain in critical fault
+    return FSM_STATE_FAULT_CRITICAL;
 }
 
-FSM_State_t transition_system_off(){
-    return FSM_STATE_SYSTEM_OFF;
-}
+/* Removed unused shutdown/system off functions and all references to them */
 

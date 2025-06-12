@@ -61,39 +61,45 @@ BMSErrorCode_t bqGetAllCellVoltages(BMSOverallData_t *bmsData) {
 }
 
 BMSErrorCode_t bqGetAllTemperatures(BMSOverallData_t *bmsData) {
-    // BMS_DEBUG_PRINTLN("Reading all temperatures...");
-    uint8_t rawTempData[MAX_STACK_RESPONSE_BUFFER_SIZE]; 
-    
+    // Reference: legacy code and cell voltage access pattern
+    uint8_t rawTempData[(TEMP_SENSORS_PER_SLAVE * 2 + 6) * NUM_BQ79616_DEVICES] = {0};
+
     BMSErrorCode_t status = bqStackRead(GPIO1_HI, rawTempData, TEMP_SENSORS_PER_SLAVE * 2, SERIAL_TIMEOUT_MS * NUM_BQ79616_DEVICES);
     if (status != BMS_OK) {
         BMS_DEBUG_PRINTLN("Failed to read GPIO temperatures from stack.");
         return status;
     }
 
-    for (int i = 0; i < NUM_BQ79616_DEVICES; ++i) {
-        for (int j = 0; j < TEMP_SENSORS_PER_SLAVE; ++j) {
-            int raw_idx = (i * TEMP_SENSORS_PER_SLAVE * 2) + (j * 2);
+    // Steinhart-Hart coefficients (use legacy values)
+    const float a1 = 0.003354016f;
+    const float b1 = 0.000256524f;
+    const float c1 = 2.61E-6f;
+    const float d1 = 6.33E-8f;
+    const float REF_RESISTOR = 10000.0f;
+    const float REF_VOLTAGE = 5.0f;
+
+    for (uint16_t cb = 0; cb < NUM_BQ79616_DEVICES; cb++) {
+        // Each module's temp data is packed sequentially, just like voltages
+        for (int i = 0; i < TEMP_SENSORS_PER_SLAVE; i++) {
+            int raw_idx = (cb * TEMP_SENSORS_PER_SLAVE * 2) + (i * 2);
             uint8_t msb = rawTempData[raw_idx];
             uint8_t lsb = rawTempData[raw_idx + 1];
-            int16_t raw_gpio_voltage_adc = (int16_t)((msb << 8) | lsb);
-            
-            float gpio_voltage_uv = (float)raw_gpio_voltage_adc * 152.59f; 
-            float gpio_voltage_mv = gpio_voltage_uv / 1000.0f;
-
-            if ( (NTC_V_TSREF * 1000.0f) - gpio_voltage_mv <= 1.0f) { // Check against 1mV to avoid div by zero or near-zero
-                 bmsData->modules[i].cellTemperatures[j] = -2731; 
-                 continue;
+            uint16_t raw_data = ((msb & 0xFF) << 8) | (lsb & 0xFF);
+            float temp_voltage = (float)raw_data * 0.15259f;
+            if (temp_voltage >= 4800.0f) {
+                bmsData->modules[cb].cellTemperatures[i] = 255;
+            } else {
+                float voltage = temp_voltage / 1000.0f;
+                float resistance = (REF_RESISTOR * voltage) / (REF_VOLTAGE - voltage);
+                float log_r = logf(resistance / REF_RESISTOR);
+                float temp_c = 1.0f / (a1 + b1 * log_r + c1 * powf(log_r, 2) + d1 * powf(log_r, 3)) - 273.15f;
+                bmsData->modules[cb].cellTemperatures[i] = (int16_t)(temp_c * 10.0f);
             }
-            
-            float resistance_ohm = (gpio_voltage_mv * NTC_R_DIVIDER) / ((NTC_V_TSREF * 1000.0f) - gpio_voltage_mv);
-            
-            float temp_c = resistanceToTemperature(resistance_ohm);
-            bmsData->modules[i].cellTemperatures[j] = (int16_t)(temp_c * 10.0f);
         }
     }
-
-    status = bqStackRead(DIETEMP1_LO, rawTempData, 2, SERIAL_TIMEOUT_MS * NUM_BQ79616_DEVICES);
-     if (status != BMS_OK) {
+    // Read die temperatures after GPIO temperatures
+    status = bqStackRead(DIETEMP1_LO, rawTempData, 2 * NUM_BQ79616_DEVICES, SERIAL_TIMEOUT_MS * NUM_BQ79616_DEVICES);
+    if (status != BMS_OK) {
         BMS_DEBUG_PRINTLN("Failed to read die temperatures from stack.");
         return status;
     }
@@ -275,49 +281,31 @@ void readSystemInputs(BMSOverallData_t *bmsData) {
 }
 
 
-BMSErrorCode_t bqStartCellBalancing(BMSOverallData_t *bmsData, uint8_t moduleIndex, uint8_t cellToBalanceIndex, uint8_t duration_code) {
-    if (moduleIndex >= NUM_BQ79616_DEVICES || cellToBalanceIndex >= CELLS_PER_SLAVE) return BMS_ERROR_UNKNOWN; 
-
-    uint8_t deviceAddress = moduleIndex + 1; 
-    uint16_t cb_ctrl_reg = CB_CELL1_CTRL - cellToBalanceIndex; // Assumes CB_CELL1_CTRL is highest address for cell 1
-                                                              // B0_reg.h: CB_CELL1_CTRL (0x327) ... CB_CELL16_CTRL (0x318)
-                                                              // Correct: CB_CELL16_CTRL (0x318) up to CB_CELL1_CTRL (0x327)
-                                                              // So for cell index j (0-15), reg is CB_CELL1_CTRL - j
-    
-    BMSErrorCode_t status = bqWriteReg(deviceAddress, cb_ctrl_reg, duration_code, 1, FRMWRT_SGL_W);
-    if (status != BMS_OK) {
-        BMS_DEBUG_PRINTF("ERROR starting balancing on Mod %d Cell %d\n", moduleIndex, cellToBalanceIndex);
-        return status;
-    }
-    
-    // Ensure BAL_GO is set. Read BAL_CTRL2 first to preserve other settings.
-    uint8_t balCtrl2Val = 0;
-    status = bqReadReg(deviceAddress, BAL_CTRL2, &balCtrl2Val, 1, FRMWRT_SGL_R);
-    if (status != BMS_OK) { BMS_DEBUG_PRINTLN("ERROR reading BAL_CTRL2 before starting balance"); return status; }
-
-    balCtrl2Val |= (1 << 1); // Set BAL_GO (bit 1)
-    balCtrl2Val |= (1 << 0); // Ensure AUTO_BAL (bit 0) is set for timed balancing
-    status = bqWriteReg(deviceAddress, BAL_CTRL2, balCtrl2Val, 1, FRMWRT_SGL_W);
-    
+BMSErrorCode_t bqStartCellBalancing(BMSOverallData_t *bmsData) {
+    // Issue the legacy stack-wide balance command for all modules
+    BMSErrorCode_t status = bqWriteReg(0, BAL_CTRL2, 0x33, 1, FRMWRT_STK_W);
     if (status == BMS_OK) {
-        bmsData->activeBalancingCells[moduleIndex] |= (1 << cellToBalanceIndex);
+        bmsData->balancing_cycle_active = true;
+        bmsData->balancing_request = false; // Clear request since we're now active
+        Serial.println("Stack-wide cell balancing started.");
+    } else {
+        Serial.println("Failed to start stack-wide cell balancing.");
     }
     return status;
 }
 
-BMSErrorCode_t bqStopCellBalancing(uint8_t moduleIndex, uint8_t cellToBalanceIndex) {
-    if (moduleIndex >= NUM_BQ79616_DEVICES || cellToBalanceIndex >= CELLS_PER_SLAVE) return BMS_ERROR_UNKNOWN;
-    uint8_t deviceAddress = moduleIndex + 1;
-    uint16_t cb_ctrl_reg = CB_CELL1_CTRL - cellToBalanceIndex; 
-
-    BMSErrorCode_t status = bqWriteReg(deviceAddress, cb_ctrl_reg, 0x00, 1, FRMWRT_SGL_W); // 0 sec timer to stop
+BMSErrorCode_t bqStopCellBalancing(BMSOverallData_t *bmsData) {
+    // Stop balancing for the entire stack by writing MB_TIMER_CTRL = 0 to all modules
+    BMSErrorCode_t status = bqWriteReg(0, MB_TIMER_CTRL, 0x0, 1, FRMWRT_STK_W);
     if (status == BMS_OK) {
-        g_bmsData.activeBalancingCells[moduleIndex] &= ~(1 << cellToBalanceIndex);
+        // Optionally clear tracking for all modules
+        for (uint8_t i = 0; i < NUM_BQ79616_DEVICES; ++i) {
+            bmsData->activeBalancingCells[i] = 0;
+        }
+        Serial.println("Stack-wide cell balancing stopped.");
     } else {
-        BMS_DEBUG_PRINTF("ERROR stopping balancing on Mod %d Cell %d\n", moduleIndex, cellToBalanceIndex);
+        Serial.println("Failed to stop stack-wide cell balancing.");
     }
-    // Re-asserting BAL_GO might not be necessary if individual timers are set to 0.
-    // The BQ chip should stop balancing that cell when its timer is set to 0 and BAL_GO is active.
     return status;
 }
 
@@ -426,7 +414,7 @@ void printBQDump() {
     BMS_DEBUG_PRINTLN("--- End of BQ Register Dump ---");
 }
 
-void printCellData(const BMSOverallData_t *d)
+void send_pack_data(const BMSOverallData_t *d)
 {
 
     // 2) Pack metrics
@@ -449,10 +437,10 @@ void printCellData(const BMSOverallData_t *d)
 
     // 4) Balancing & interlocks
     Serial.println("\n--- Balancing & Interlocks ---");
-    for (uint8_t m=0; m<NUM_BQ79616_DEVICES; ++m) {
-        Serial.printf("Module %u active balance cell: %u\n",
-                      m, d->activeBalancingCells[m]);
-    }
+    // for (uint8_t m=0; m<NUM_BQ79616_DEVICES; ++m) {
+    //     Serial.printf("Module %u active balance cell: %u\n",
+    //                   m, d->activeBalancingCells[m]);
+    // }
     Serial.printf("Balancing requested  : %s\n", d->balancing_request      ? "YES":"no");
     Serial.printf("Balancing active     : %s\n", d->balancing_cycle_active? "YES":"no");
     Serial.printf("Reset pin active     : %s\n", d->reset_pin_active      ? "YES":"no");

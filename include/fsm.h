@@ -12,8 +12,6 @@ typedef enum {
     FSM_STATE_FAULT_MEASUREMENT,
     FSM_STATE_FAULT_STARTUP_ERROR,
     FSM_STATE_FAULT_CRITICAL,
-    FSM_STATE_SHUTDOWN_PROCEDURE,
-    FSM_STATE_SYSTEM_OFF 
 } FSM_State_t;
 
 extern FSM_State_t g_currentState;
@@ -38,15 +36,10 @@ void action_fault_startup_error();
 FSM_State_t transition_fault_startup_error();
 void action_fault_critical();
 FSM_State_t transition_fault_critical();
-void action_shutdown_procedure();
-FSM_State_t transition_shutdown_procedure();
-void action_system_off();
-FSM_State_t transition_system_off();
+
 
 // Helper for NTC voltage conversion
 float convertTemperatureToNtcVoltage(float temperatureC);
-// Helper for essential stack configs during recovery
-BMSErrorCode_t applyEssentialStackConfigsForRecovery();
 
 
 #endif // FSM_H

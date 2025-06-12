@@ -145,10 +145,10 @@ void can_send_bms_data(const BMSOverallData_t *bmsData) {
 void can_process_incoming_messages() { 
     CAN_message_t msg;
     if (CanBus.read(msg)) {
-        BMS_DEBUG_PRINTF("CAN RX ID: 0x%03X, Len: %d, Data: ", msg.id, msg.len);
+        //BMS_DEBUG_PRINTF("CAN RX ID: 0x%03X, Len: %d, Data: ", msg.id, msg.len);
         for (int i = 0; i < msg.len; ++i) {
-            BMS_DEBUG_PRINTF("%02X ", msg.buf[i]);
+            //BMS_DEBUG_PRINTF("%02X ", msg.buf[i]);
         }
-        BMS_DEBUG_PRINTLN("");
+        //BMS_DEBUG_PRINTLN("");
     }
 }
